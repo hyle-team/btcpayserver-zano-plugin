@@ -22,24 +22,30 @@ public static class IntegrationTestUtils
     private static readonly string ContainerWalletDir =
         Environment.GetEnvironmentVariable("BTCPAY_XMR_WALLET_DAEMON_WALLETDIR") ?? "/wallet";
 
-    public static async Task CleanUpAsync(PlaywrightTester playwrightTester)
+    public static async Task CleanUpAsync(PlaywrightTester playwrightTester, bool deleteWalletFiles = true)
     {
         MoneroRpcProvider moneroRpcProvider = playwrightTester.Server.PayTester.GetService<MoneroRpcProvider>();
-        if (moneroRpcProvider.IsAvailable("XMR"))
-        {
-            await moneroRpcProvider.CloseWallet("XMR");
-        }
+        await moneroRpcProvider.CloseWallet("XMR");
+
+        MoneroWalletService walletService = playwrightTester.Server.PayTester.GetService<MoneroWalletService>();
+        walletService.GetWalletState().IsConnected = false;
 
         if (playwrightTester.Server.PayTester.InContainer)
         {
-            DeleteWalletInContainer();
+            if (deleteWalletFiles)
+            {
+                moneroRpcProvider.DeleteAllWallets();
+            }
             await DropDatabaseAsync(
                 "btcpayserver",
                 "Host=postgres;Port=5432;Username=postgres;Database=postgres");
         }
         else
         {
-            await RemoveWalletFromLocalDocker();
+            if (deleteWalletFiles)
+            {
+                await RemoveWalletFromLocalDocker();
+            }
             await DropDatabaseAsync(
                 "btcpayserver",
                 "Host=localhost;Port=39372;Username=postgres;Database=postgres");
@@ -55,7 +61,7 @@ public static class IntegrationTestUtils
             await new NpgsqlCommand($"""
                                      SELECT pg_terminate_backend(pid)
                                      FROM pg_stat_activity
-                                     WHERE datname = '{dbName}' 
+                                     WHERE datname = '{dbName}'
                                        AND pid <> pg_backend_pid();
                                      """, conn).ExecuteNonQueryAsync();
             var cmd = new NpgsqlCommand($"DROP DATABASE IF EXISTS {dbName};", conn);
