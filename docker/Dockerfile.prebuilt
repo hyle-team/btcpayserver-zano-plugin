@@ -1,0 +1,25 @@
+# Quick image using pre-built binaries
+# Build: docker build -f Dockerfile.prebuilt --build-arg BINARY_DIR=/path/to/binaries .
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    libboost-filesystem1.74.0 libboost-thread1.74.0 \
+    libboost-program-options1.74.0 libboost-regex1.74.0 \
+    libboost-serialization1.74.0 libboost-system1.74.0 \
+    libboost-date-time1.74.0 libboost-chrono1.74.0 \
+    libboost-locale1.74.0 \
+    libssl3 libunwind8 curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY zanod /usr/local/bin/zanod
+COPY simplewallet /usr/local/bin/simplewallet
+
+RUN chmod +x /usr/local/bin/zanod /usr/local/bin/simplewallet && \
+    mkdir -p /data /wallet
+
+VOLUME ["/data", "/wallet"]
+
+EXPOSE 11211 11212
+
+ENTRYPOINT ["zanod"]
+CMD ["--rpc-bind-ip=0.0.0.0", "--rpc-bind-port=11211", "--data-dir=/data"]

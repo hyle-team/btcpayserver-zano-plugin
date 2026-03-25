@@ -1,0 +1,43 @@
+@using BTCPayServer.Plugins.Zano.Configuration
+@using BTCPayServer.Plugins.Zano.Controllers
+@using BTCPayServer.Abstractions.Contracts
+@using BTCPayServer.Payments
+@using BTCPayServer.Plugins.Zano.Payments
+@using BTCPayServer.Services.Invoices
+@inject SignInManager<ApplicationUser> SignInManager;
+@inject ZanoConfiguration ZanoConfiguration;
+@inject IScopeProvider ScopeProvider
+@inject PaymentMethodHandlerDictionary Handlers
+@{
+    var storeId = ScopeProvider.GetCurrentStoreId();
+}
+@if (SignInManager.IsSignedIn(User) && User.IsInRole(Roles.ServerAdmin) && ZanoConfiguration.ZanoConfigurationItems.Any())
+{
+    var store = Context.GetStoreData();
+    var excludeFilters = store.GetStoreBlob().GetExcludedPaymentMethods();
+
+    foreach (var configItem in ZanoConfiguration.ZanoConfigurationItems)
+    {
+        var cryptoCode = configItem.Key;
+        var pmi = PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode);
+        var settings = store.GetPaymentMethodConfigs(Handlers)
+            .Where(s => s.Value is ZanoPaymentPromptDetails && s.Key == pmi)
+            .Select(s => s.Value)
+            .SingleOrDefault();
+        var enabled = settings != null && !excludeFilters.Match(pmi);
+
+        var isActive = !string.IsNullOrEmpty(storeId) && ViewContext.RouteData.Values.TryGetValue("Controller", out var controller) && controller is not null &&
+                       nameof(UIZanoStoreController).StartsWith(controller.ToString() ?? string.Empty, StringComparison.InvariantCultureIgnoreCase) &&
+                       ViewContext.RouteData.Values.TryGetValue("cryptoCode", out var routeCryptoCode) && routeCryptoCode is not null && routeCryptoCode.ToString() == cryptoCode;
+        <li class="nav-item">
+            <a class="nav-link @(isActive ? "active" : "")"
+               asp-route-cryptoCode="@cryptoCode"
+               asp-route-storeId="@storeId"
+               asp-action="GetStoreZanoPaymentMethod"
+               asp-controller="UIZanoStore">
+                <span class="me-2 btcpay-status btcpay-status--@(enabled ? "enabled" : "pending")"></span>
+                <span>@(cryptoCode == "ZANO" ? "Zano" : cryptoCode + " Wallet")</span>
+            </a>
+        </li>
+    }
+}

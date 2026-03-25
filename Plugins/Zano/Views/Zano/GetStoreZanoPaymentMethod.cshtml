@@ -1,0 +1,95 @@
+@using ZanoPaymentMethodViewModel = BTCPayServer.Plugins.Zano.Controllers.UIZanoStoreController.ZanoPaymentMethodViewModel
+@using ZanoSettlementThresholdChoice = BTCPayServer.Plugins.Zano.Controllers.UIZanoStoreController.ZanoSettlementThresholdChoice;
+@model ZanoPaymentMethodViewModel
+
+@{
+    ViewData.SetActivePage(Model.CryptoCode, StringLocalizer["{0} Settings", Model.CryptoCode], Model.CryptoCode);
+    Layout = "_Layout";
+}
+
+<partial name="_StatusMessage" />
+
+<div class="row">
+    <div class="col-md-8">
+        @if (!ViewContext.ModelState.IsValid)
+        {
+            <div asp-validation-summary="All"></div>
+        }
+        @if (Model.Summary != null)
+        {
+            <div class="card">
+                <ul class="list-group list-group-flush">
+                    <li class="list-group-item">Node available: @Model.Summary.DaemonAvailable</li>
+                    <li class="list-group-item">Wallet RPC available: @Model.Summary.WalletAvailable</li>
+                    <li class="list-group-item">Last updated: @Model.Summary.UpdatedAt</li>
+                    <li class="list-group-item">Synced: @Model.Summary.Synced (@Model.Summary.CurrentHeight / @Model.Summary.TargetHeight)</li>
+                </ul>
+            </div>
+        }
+
+        @if (Model.Summary?.WalletAvailable != true)
+        {
+            <div class="alert alert-info mt-4">
+                <p>To accept Zano payments, you need a Zano wallet running in RPC mode.</p>
+                <p>Start <code>simplewallet</code> with <code>--rpc-bind-port</code> and configure <code>BTCPAY_ZANO_WALLET_DAEMON_URI</code> to point to it.</p>
+                <p>For view-only monitoring, create a watch-only wallet using <code>simplewallet --save_watch_only</code> first.</p>
+            </div>
+        }
+
+        <form method="post" asp-action="GetStoreZanoPaymentMethod"
+              asp-route-storeId="@Context.GetRouteValue("storeId")"
+              asp-route-cryptoCode="@Context.GetRouteValue("cryptoCode")"
+              class="mt-4">
+
+            <input type="hidden" asp-for="CryptoCode"/>
+
+            <div class="form-group">
+                <label asp-for="Enabled"></label>
+                <input asp-for="Enabled" type="checkbox" class="form-check"/>
+                <span asp-validation-for="Enabled" class="text-danger"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="SettlementConfirmationThresholdChoice" class="form-label"></label>
+                <a href="https://docs.btcpayserver.org/FAQ/Stores/#consider-the-invoice-confirmed-when-the-payment-transaction" target="_blank" rel="noreferrer noopener" title="@StringLocalizer["More information..."]">
+                    <vc:icon symbol="info" />
+                </a>
+                <select
+                    asp-for="SettlementConfirmationThresholdChoice"
+                    asp-items="Html.GetEnumSelectList<ZanoSettlementThresholdChoice>()"
+                    class="form-select w-auto"
+                    onchange="
+                        document.getElementById('unconfirmed-warning').hidden = this.value !== '@((int)ZanoSettlementThresholdChoice.ZeroConfirmation)';
+                        document.getElementById('custom-confirmation-value').hidden = this.value !== '@((int)ZanoSettlementThresholdChoice.Custom)';">
+                </select>
+                <span asp-validation-for="SettlementConfirmationThresholdChoice" class="text-danger"></span>
+                <p class="info-note my-3 text-warning" id="unconfirmed-warning" role="alert" hidden="@(Model.SettlementConfirmationThresholdChoice is not ZanoSettlementThresholdChoice.ZeroConfirmation)">
+                    <vc:icon symbol="warning" />
+                    <span text-translate="true">Choosing to accept an unconfirmed invoice can lead to double-spending and is strongly discouraged.</span>
+                </p>
+            </div>
+
+            <div class="form-group" id="custom-confirmation-value" hidden="@(Model.SettlementConfirmationThresholdChoice is not ZanoSettlementThresholdChoice.Custom)">
+                <label asp-for="CustomSettlementConfirmationThreshold" class="form-label"></label>
+                <input
+                    asp-for="CustomSettlementConfirmationThreshold"
+                    type="number"
+                    value="@(Model.CustomSettlementConfirmationThreshold)"
+                    class="form-control w-auto"
+                    min="0"
+                    max="100"
+                    pattern="\d+"
+                />
+                <span asp-validation-for="CustomSettlementConfirmationThreshold" class="text-danger"></span>
+            </div>
+
+            <div class="form-group">
+                <button type="submit" class="btn btn-primary" id="SaveButton">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+@section PageFootContent {
+    @await Html.PartialAsync("_ValidationScriptsPartial")
+}
