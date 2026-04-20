@@ -78,10 +78,18 @@ namespace BTCPayServer.Plugins.Zano.Payments
             var details = new ZanoOnChainPaymentMethodDetails()
             {
                 PaymentId = zanoPrepare.PaymentId,
-                InvoiceSettledConfirmationThreshold = ParsePaymentMethodConfig(context.PaymentMethodConfig).InvoiceSettledConfirmationThreshold
+                InvoiceSettledConfirmationThreshold = ParsePaymentMethodConfig(context.PaymentMethodConfig).InvoiceSettledConfirmationThreshold,
+                AssetId = _network.AssetId
             };
             context.Prompt.Destination = address.IntegratedAddress;
-            context.Prompt.PaymentMethodFee = ZanoMoney.Convert(FixedFeeAtomicUnits);
+            // The Zano tx fee is paid in native ZANO by the sender out-of-band, so for
+            // Confidential Assets the invoice's PaymentMethodFee must be 0 — otherwise
+            // the fixed ZANO fee (0.01, 12-decimals) gets reinterpreted in the CA's
+            // divisibility and produces a nonsensical due amount (e.g. 1M FUSD for a $1
+            // invoice when FUSD has 4 decimals).
+            context.Prompt.PaymentMethodFee = _network.IsNative
+                ? ZanoMoney.Convert(FixedFeeAtomicUnits, _network.Divisibility)
+                : 0m;
             context.Prompt.Details = JObject.FromObject(details, Serializer);
             context.TrackedDestinations.Add(address.IntegratedAddress);
         }

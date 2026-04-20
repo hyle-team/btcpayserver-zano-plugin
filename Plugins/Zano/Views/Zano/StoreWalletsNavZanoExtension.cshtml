@@ -1,3 +1,4 @@
+@using BTCPayServer.Plugins.Zano
 @using BTCPayServer.Plugins.Zano.Configuration
 @using BTCPayServer.Plugins.Zano.Controllers
 @using BTCPayServer.Abstractions.Contracts
@@ -8,6 +9,7 @@
 @inject ZanoConfiguration ZanoConfiguration;
 @inject IScopeProvider ScopeProvider
 @inject PaymentMethodHandlerDictionary Handlers
+@inject BTCPayNetworkProvider NetworkProvider
 @{
     var storeId = ScopeProvider.GetCurrentStoreId();
 }
@@ -26,6 +28,11 @@
             .SingleOrDefault();
         var enabled = settings != null && !excludeFilters.Match(pmi);
 
+        var network = NetworkProvider.GetNetwork(cryptoCode) as ZanoSpecificBtcPayNetwork;
+        var label = network?.IsNative == true
+            ? "Zano"
+            : (network?.DisplayName ?? cryptoCode) + " (Zano)";
+
         var isActive = !string.IsNullOrEmpty(storeId) && ViewContext.RouteData.Values.TryGetValue("Controller", out var controller) && controller is not null &&
                        nameof(UIZanoStoreController).StartsWith(controller.ToString() ?? string.Empty, StringComparison.InvariantCultureIgnoreCase) &&
                        ViewContext.RouteData.Values.TryGetValue("cryptoCode", out var routeCryptoCode) && routeCryptoCode is not null && routeCryptoCode.ToString() == cryptoCode;
@@ -36,7 +43,7 @@
                asp-action="GetStoreZanoPaymentMethod"
                asp-controller="UIZanoStore">
                 <span class="me-2 btcpay-status btcpay-status--@(enabled ? "enabled" : "pending")"></span>
-                <span>@(cryptoCode == "ZANO" ? "Zano" : cryptoCode + " Wallet")</span>
+                <span>@label</span>
             </a>
         </li>
     }

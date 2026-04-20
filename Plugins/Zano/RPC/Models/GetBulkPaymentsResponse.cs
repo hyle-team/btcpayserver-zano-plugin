@@ -16,5 +16,6 @@ namespace BTCPayServer.Plugins.Zano.RPC.Models
         [JsonProperty("payment_id")] public string PaymentId { get; set; }
         [JsonProperty("tx_hash")] public string TxHash { get; set; }
         [JsonProperty("unlock_time")] public long UnlockTime { get; set; }
+        [JsonProperty("asset_id")] public string AssetId { get; set; }
     }
 }

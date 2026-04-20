@@ -28,7 +28,10 @@ namespace BTCPayServer.Plugins.Zano.Payments
         public PaymentMethodId PaymentMethodId { get; }
 
         public string Image => _network.CryptoImagePath;
-        public string Badge => "";
+        public string Badge =>
+            _network is ZanoSpecificBtcPayNetwork zn && !zn.IsNative
+                ? zn.AssetTicker
+                : "";
 
         public void ModifyCheckoutModel(CheckoutModelContext context)
         {

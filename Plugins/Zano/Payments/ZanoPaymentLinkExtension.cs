@@ -22,7 +22,12 @@ namespace BTCPayServer.Plugins.Zano.Payments
         public string? GetPaymentLink(PaymentPrompt prompt, IUrlHelper? urlHelper)
         {
             var due = prompt.Calculate().Due;
-            return $"{_network.UriScheme}:{prompt.Destination}?tx_amount={due.ToString(CultureInfo.InvariantCulture)}";
+            var uri = $"{_network.UriScheme}:{prompt.Destination}?tx_amount={due.ToString(CultureInfo.InvariantCulture)}";
+            if (!_network.IsNative && !string.IsNullOrEmpty(_network.AssetId))
+            {
+                uri += $"&asset_id={_network.AssetId}";
+            }
+            return uri;
         }
     }
 }
