@@ -77,10 +77,10 @@ public class ZanoAssetDefinition
             {
                 throw new FormatException($"Extra-asset ticker '{ticker}' collides with native ZANO.");
             }
-            if (assetId.Length != 64)
+            if (assetId.Length != 64 || !IsLowercaseHex(assetId))
             {
                 throw new FormatException(
-                    $"Extra-asset '{ticker}' asset_id must be 64 hex chars (got {assetId.Length}).");
+                    $"Extra-asset '{ticker}' asset_id must be 64 hex chars (got '{parts[1]}').");
             }
             if (string.Equals(assetId, ZanoAssets.NativeAssetId, StringComparison.OrdinalIgnoreCase))
             {
@@ -134,6 +134,18 @@ public class ZanoAssetDefinition
         }
 
         return list;
+    }
+
+    private static bool IsLowercaseHex(string s)
+    {
+        foreach (var c in s)
+        {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static ZanoAssetRateMode ParseRateMode(string ticker, string raw)

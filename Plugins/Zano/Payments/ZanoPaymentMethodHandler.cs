@@ -6,7 +6,6 @@ using BTCPayServer.Data;
 using BTCPayServer.Payments;
 using BTCPayServer.Plugins.Zano.RPC.Models;
 using BTCPayServer.Plugins.Zano.Services;
-using BTCPayServer.Plugins.Zano.Utils;
 
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -21,9 +20,6 @@ namespace BTCPayServer.Plugins.Zano.Payments
         private readonly ZanoRpcProvider _zanoRpcProvider;
 
         public PaymentMethodId PaymentMethodId { get; }
-
-        // Fixed fee: 0.01 ZANO in atomic units (12 decimals)
-        private const long FixedFeeAtomicUnits = 10_000_000_000;
 
         public ZanoPaymentMethodHandler(ZanoSpecificBtcPayNetwork network, ZanoRpcProvider zanoRpcProvider)
         {
@@ -82,14 +78,13 @@ namespace BTCPayServer.Plugins.Zano.Payments
                 AssetId = _network.AssetId
             };
             context.Prompt.Destination = address.IntegratedAddress;
-            // The Zano tx fee is paid in native ZANO by the sender out-of-band, so for
-            // Confidential Assets the invoice's PaymentMethodFee must be 0 — otherwise
-            // the fixed ZANO fee (0.01, 12-decimals) gets reinterpreted in the CA's
-            // divisibility and produces a nonsensical due amount (e.g. 1M FUSD for a $1
-            // invoice when FUSD has 4 decimals).
-            context.Prompt.PaymentMethodFee = _network.IsNative
-                ? ZanoMoney.Convert(FixedFeeAtomicUnits, _network.Divisibility)
-                : 0m;
+            // The Zano tx fee is paid out-of-band by the sender's wallet from their own
+            // balance — it is never deducted from the merchant payout, so PaymentMethodFee
+            // must stay 0. Adding the fee here (e.g. as a "Network Cost" buffer) double-
+            // charges: customer would pay invoice + buffer, the wallet then adds the actual
+            // network fee on top, and the merchant receives invoice + buffer instead of the
+            // exact invoice amount.
+            context.Prompt.PaymentMethodFee = 0m;
             context.Prompt.Details = JObject.FromObject(details, Serializer);
             context.TrackedDestinations.Add(address.IntegratedAddress);
         }

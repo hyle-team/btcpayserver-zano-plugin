@@ -22,6 +22,29 @@ namespace BTCPayServer.Plugins.Zano.Utils
             return decimal.Parse(amt, CultureInfo.InvariantCulture);
         }
 
+        // Wide-amount overload (distinct name because C# can't overload on return type):
+        // accepts atomic-unit amounts above long.MaxValue, which is required for
+        // high-divisibility Confidential Assets (an 18-decimal CA tops out at
+        // ~9.22 units when amounts are constrained to a signed 64-bit int).
+        public static decimal FromAtomic(decimal atomicUnits, int decimals)
+        {
+            if (decimals < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(decimals));
+            }
+            if (decimals == 0)
+            {
+                return atomicUnits;
+            }
+
+            decimal divisor = 1m;
+            for (var i = 0; i < decimals; i++)
+            {
+                divisor *= 10m;
+            }
+            return atomicUnits / divisor;
+        }
+
         public static long Convert(decimal zano, int decimals)
         {
             if (decimals < 0)

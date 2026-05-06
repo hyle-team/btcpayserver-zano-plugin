@@ -12,6 +12,7 @@ using BTCPayServer.Plugins.Zano.Configuration;
 using BTCPayServer.Plugins.Zano.Payments;
 using BTCPayServer.Plugins.Zano.Services;
 using BTCPayServer.Services;
+using BTCPayServer.Services.Rates;
 
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -62,6 +63,14 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
 
         RegisterNetwork(services, nativeNetwork, blockExplorerLink);
 
+        // Register ZANO + each configured CA in BTCPay's CurrencyNameTable so they appear
+        // in the currency autocomplete dropdown (Currencies.json ships only fiat + a few
+        // legacy cryptos). Without this, merchants must type the full ticker blindly.
+        var currencyData = new List<CurrencyData>
+        {
+            new() { Code = nativeNetwork.CryptoCode, Name = nativeNetwork.DisplayName, Divisibility = nativeNetwork.Divisibility, Symbol = nativeNetwork.AssetTicker, Crypto = true }
+        };
+
         var extraAssets = ParseExtraAssets(configuration, pluginServices);
         foreach (var asset in extraAssets)
         {
@@ -78,7 +87,10 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
                 IsNative = false
             };
             RegisterNetwork(services, caNetwork, blockExplorerLink);
+            currencyData.Add(new() { Code = caNetwork.CryptoCode, Name = caNetwork.DisplayName, Divisibility = caNetwork.Divisibility, Symbol = caNetwork.AssetTicker, Crypto = true });
         }
+
+        services.AddSingleton<CurrencyDataProvider>(new InMemoryCurrencyDataProvider(currencyData.ToArray()));
 
         services.AddSingleton(provider =>
                 ConfigureZanoConfiguration(provider));

@@ -145,44 +145,94 @@ namespace BTCPayServer.Plugins.Zano.Services
                 return;
             }
 
+            var paymentIdSet = new HashSet<string>(paymentIds, StringComparer.OrdinalIgnoreCase);
+
             // get_bulk_payments is native-ZANO-only: it ignores asset_id and returns
             // amount=0 for CA transfers. get_recent_txs_and_info2 is the canonical
             // per-asset transfer list — its subtransfers_by_pid groups let us match
             // (payment_id, asset_id) and read the correct atomic amount for both
             // native and CA payments uniformly.
-            GetRecentTxsAndInfo2Response result;
-            try
+            //
+            // We page until either every monitored payment_id has been matched, the
+            // wallet history is exhausted (page returns < PageSize transfers), or a
+            // safety cap is hit. Without paging, a busy wallet (one shared between
+            // native ZANO and many CAs) could push a valid invoice payment past the
+            // first page within minutes and the listener would never see it.
+            const int PageSize = 200;
+            const int MaxPages = 10;
+            var allTransfers = new List<ZanoTransfer>();
+            var matchedPaymentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int offset = 0;
+            for (int page = 0; page < MaxPages; page++)
             {
-                result = await walletRpcClient.SendCommandAsync<GetRecentTxsAndInfo2Request, GetRecentTxsAndInfo2Response>(
-                    "get_recent_txs_and_info2",
-                    new GetRecentTxsAndInfo2Request
+                GetRecentTxsAndInfo2Response result;
+                try
+                {
+                    result = await walletRpcClient.SendCommandAsync<GetRecentTxsAndInfo2Request, GetRecentTxsAndInfo2Response>(
+                        "get_recent_txs_and_info2",
+                        new GetRecentTxsAndInfo2Request
+                        {
+                            Offset = offset,
+                            Count = PageSize,
+                            UpdateProvisionInfo = false
+                        });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to query recent txs for {CryptoCode} at offset {Offset}", cryptoCode, offset);
+                    return;
+                }
+
+                if (result?.Transfers == null || result.Transfers.Count == 0)
+                {
+                    break;
+                }
+
+                allTransfers.AddRange(result.Transfers);
+
+                foreach (var tx in result.Transfers)
+                {
+                    if (tx.SubtransfersByPid == null)
                     {
-                        Offset = 0,
-                        Count = 200,
-                        UpdateProvisionInfo = false
-                    });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to query recent txs for {CryptoCode}", cryptoCode);
-                return;
+                        continue;
+                    }
+                    foreach (var group in tx.SubtransfersByPid)
+                    {
+                        if (!string.IsNullOrEmpty(group.PaymentId) && paymentIdSet.Contains(group.PaymentId))
+                        {
+                            matchedPaymentIds.Add(group.PaymentId);
+                        }
+                    }
+                }
+
+                if (matchedPaymentIds.Count >= paymentIdSet.Count)
+                {
+                    break;
+                }
+                if (result.Transfers.Count < PageSize)
+                {
+                    break;
+                }
+                offset += PageSize;
             }
 
-            if (result?.Transfers == null || result.Transfers.Count == 0)
+            if (allTransfers.Count == 0)
             {
-                await UpdateExistingPaymentConfirmations(cryptoCode, invoices, handler, currentHeight);
+                // Wallet returned no transfers at all — don't bump confs from stale
+                // local data. The next poll will retry; if a recorded payment really
+                // did go away, its status simply won't change here.
                 return;
             }
-
-            var paymentIdSet = new HashSet<string>(paymentIds, StringComparer.OrdinalIgnoreCase);
 
             // Flatten into (txHash, pid, assetId, amount, height, unlock) candidates,
             // filtered to income subtransfers whose payment_id matches a pending invoice
             // AND whose asset_id matches the current network's asset. This naturally
             // skips: our own outgoing tx legs, native-ZANO change outputs on CA txs,
             // and payments targeting other registered Zano networks.
-            var candidates = new List<(long Amount, string PaymentId, string AssetId, string TxHash, long Height, long UnlockTime)>();
-            foreach (var tx in result.Transfers)
+            // Amount is decimal — see ZanoSubtransfer.Amount comment for the long-overflow
+            // rationale on high-divisibility CAs.
+            var candidates = new List<(decimal Amount, string PaymentId, string AssetId, string TxHash, long Height, long UnlockTime)>();
+            foreach (var tx in allTransfers)
             {
                 if (tx.SubtransfersByPid == null)
                 {
@@ -216,19 +266,16 @@ namespace BTCPayServer.Plugins.Zano.Services
 
             if (candidates.Count == 0)
             {
-                await UpdateExistingPaymentConfirmations(cryptoCode, invoices, handler, currentHeight);
+                // No match for any monitored payment_id. Same reasoning as above:
+                // never bump confirmations from stale local data without wallet
+                // confirmation that the tx is still present.
                 return;
             }
 
             var updatedPaymentEntities = new List<(PaymentEntity Payment, InvoiceEntity invoice)>();
             var processingTasks = new List<Task>();
 
-            // Dedupe mempool + confirmed entries for the same (tx, pid, asset): prefer
-            // the confirmed row (highest height).
-            var dedupedCandidates = candidates
-                .GroupBy(c => $"{c.TxHash}#{c.PaymentId}#{c.AssetId}", StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.OrderByDescending(c => c.Height).First())
-                .ToList();
+            var dedupedCandidates = AggregateCandidates(candidates);
 
             foreach (var cand in dedupedCandidates)
             {
@@ -244,8 +291,11 @@ namespace BTCPayServer.Plugins.Zano.Services
                     continue;
                 }
 
+                // Clamp ≥ 0: a chain reorg can briefly drop currentHeight below
+                // cand.Height, which would otherwise produce a negative confirmation
+                // count and a nonsense status decision.
                 long confirmations = cand.Height > 0 && currentHeight > 0
-                    ? currentHeight - cand.Height + 1
+                    ? Math.Max(0L, currentHeight - cand.Height + 1)
                     : 0;
 
                 _logger.LogInformation(
@@ -277,48 +327,13 @@ namespace BTCPayServer.Plugins.Zano.Services
             }
         }
 
-        private async Task UpdateExistingPaymentConfirmations(string cryptoCode, InvoiceEntity[] invoices,
-            ZanoPaymentMethodHandler handler, long currentHeight)
-        {
-            if (currentHeight <= 0)
-            {
-                return;
-            }
+        // UpdateExistingPaymentConfirmations was removed: it bumped confirmations from
+        // stored BlockHeight + daemon currentHeight whenever the wallet returned no
+        // matching candidate, which silently aged reorged-out or wallet-dropped
+        // payments to Settled. Confirmations now update only via the candidate path
+        // below — i.e. only when the wallet still reports the transaction.
 
-            var updatedPayments = new List<(PaymentEntity Payment, InvoiceEntity invoice)>();
-
-            foreach (var invoice in invoices)
-            {
-                var existingPayments = GetAllZanoPayments(invoice, cryptoCode);
-                foreach (var payment in existingPayments)
-                {
-                    var data = handler.ParsePaymentDetails(payment.Details);
-                    if (data.BlockHeight > 0)
-                    {
-                        var newConfirmations = currentHeight - data.BlockHeight + 1;
-                        if (newConfirmations != data.ConfirmationCount)
-                        {
-                            data.ConfirmationCount = newConfirmations;
-                            var status = GetStatus(data, invoice.SpeedPolicy) ? PaymentStatus.Settled : PaymentStatus.Processing;
-                            payment.Status = status;
-                            payment.Details = JToken.FromObject(data, handler.Serializer);
-                            updatedPayments.Add((payment, invoice));
-                        }
-                    }
-                }
-            }
-
-            if (updatedPayments.Any())
-            {
-                await _paymentService.UpdatePayments(updatedPayments.Select(t => t.Payment).ToList());
-                foreach (var group in updatedPayments.GroupBy(e => e.invoice))
-                {
-                    _eventAggregator.Publish(new InvoiceNeedUpdateEvent(group.Key.Id));
-                }
-            }
-        }
-
-        private async Task HandlePaymentData(string cryptoCode, long totalAmount, string paymentId,
+        private async Task HandlePaymentData(string cryptoCode, decimal totalAmount, string paymentId,
             string txId, long confirmations, long blockHeight, long locktime, string assetId, InvoiceEntity invoice,
             List<(PaymentEntity Payment, InvoiceEntity invoice)> paymentsToUpdate)
         {
@@ -340,7 +355,7 @@ namespace BTCPayServer.Plugins.Zano.Services
             var paymentData = new PaymentData()
             {
                 Status = status,
-                Amount = ZanoMoney.Convert(totalAmount, network.Divisibility),
+                Amount = ZanoMoney.FromAtomic(totalAmount, network.Divisibility),
                 Created = DateTimeOffset.UtcNow,
                 Id = $"{txId}#{paymentId}",
                 Currency = network.CryptoCode,
@@ -369,20 +384,80 @@ namespace BTCPayServer.Plugins.Zano.Services
         }
 
         private bool GetStatus(ZanoPaymentData details, SpeedPolicy speedPolicy)
-            => ConfirmationsRequired(details, speedPolicy) <= details.ConfirmationCount;
+            => GetStatus(details, speedPolicy, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+        public static bool GetStatus(ZanoPaymentData details, SpeedPolicy speedPolicy, long nowUnixSeconds)
+            => !IsTimestampLocked(details, nowUnixSeconds)
+               && ConfirmationsRequired(details, speedPolicy) <= details.ConfirmationCount;
+
+        // Zano `unlock_time` semantics (mirrors CryptoNote):
+        //   0                 → output unlocked from the moment the tx is mined
+        //   < 500_000_000     → absolute block height the output unlocks at
+        //   ≥ 500_000_000     → Unix timestamp the output unlocks at
+        // Most user-built txs use 0; the wallet only sets a non-zero unlock_time for
+        // specific cases (mined coinbase, time-locked sends). The previous logic
+        // compared ConfirmationCount directly against LockTime, which mis-treated an
+        // absolute block height as a confirmation count and trapped invoices in
+        // Processing forever (e.g. LockTime=13985 demanded ~13980 confs).
+        private const long ZanoBlockHeightTimestampThreshold = 500_000_000L;
+
+        // Timestamp-locked outputs are not spendable until wall-clock time reaches the
+        // lock. ConfirmationsRequired() can't express "wait until time T" as a
+        // confirmation count, so settlement is gated separately in GetStatus(). The
+        // listener polling loop re-evaluates pending invoices on every tick, so the
+        // status flips automatically once the timestamp passes.
+        public static bool IsTimestampLocked(ZanoPaymentData details, long nowUnixSeconds)
+            => details.LockTime >= ZanoBlockHeightTimestampThreshold
+               && nowUnixSeconds < details.LockTime;
 
         public static long ConfirmationsRequired(ZanoPaymentData details, SpeedPolicy speedPolicy)
-            => (details, speedPolicy) switch
+        {
+            long baseRequired = details.InvoiceSettledConfirmationThreshold ?? speedPolicy switch
             {
-                (_, _) when details.ConfirmationCount < details.LockTime =>
-                    details.LockTime - details.ConfirmationCount,
-                ({ InvoiceSettledConfirmationThreshold: long v }, _) => v,
-                (_, SpeedPolicy.HighSpeed) => 0,
-                (_, SpeedPolicy.MediumSpeed) => 1,
-                (_, SpeedPolicy.LowMediumSpeed) => 2,
-                (_, SpeedPolicy.LowSpeed) => 6,
+                SpeedPolicy.HighSpeed => 0,
+                SpeedPolicy.MediumSpeed => 1,
+                SpeedPolicy.LowMediumSpeed => 2,
+                SpeedPolicy.LowSpeed => 6,
                 _ => 6,
             };
+
+            long lockExtra = 0;
+            if (details.LockTime > 0
+                && details.LockTime < ZanoBlockHeightTimestampThreshold
+                && details.BlockHeight > 0
+                && details.LockTime >= details.BlockHeight)
+            {
+                lockExtra = details.LockTime - details.BlockHeight + 1;
+            }
+
+            return Math.Max(baseRequired, lockExtra);
+        }
+
+        // Collapse a flat list of (tx, pid, asset, amount, height, unlock) candidates to
+        // one entry per (tx, pid, asset). A single tx can legally contain multiple income
+        // subtransfers for the same asset_id and payment_id (sender wallet composing the
+        // payment from several outputs to one integrated address), and the same tx can
+        // also appear first as a mempool row (Height=0) and again as a confirmed row.
+        // We keep the highest-height tier per (tx, pid, asset) — that resolves the
+        // mempool→confirmed transition — and sum the amounts within that tier so a
+        // multi-output payment is recorded at its full amount instead of one leg only.
+        public static IReadOnlyList<(decimal Amount, string PaymentId, string AssetId, string TxHash, long Height, long UnlockTime)>
+            AggregateCandidates(IEnumerable<(decimal Amount, string PaymentId, string AssetId, string TxHash, long Height, long UnlockTime)> candidates)
+            => candidates
+                .GroupBy(c => $"{c.TxHash}#{c.PaymentId}#{c.AssetId}", StringComparer.OrdinalIgnoreCase)
+                .Select(g =>
+                {
+                    var maxHeight = g.Max(c => c.Height);
+                    var tier = g.Where(c => c.Height == maxHeight).ToList();
+                    return (
+                        Amount: tier.Sum(c => c.Amount),
+                        PaymentId: tier[0].PaymentId,
+                        AssetId: tier[0].AssetId,
+                        TxHash: tier[0].TxHash,
+                        Height: maxHeight,
+                        UnlockTime: tier.Max(c => c.UnlockTime));
+                })
+                .ToList();
 
         private async Task UpdateAnyPendingZanoPayment(string cryptoCode)
         {

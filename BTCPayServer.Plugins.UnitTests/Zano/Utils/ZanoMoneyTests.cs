@@ -70,5 +70,21 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Utils
             long result = ZanoMoney.Convert(amt, decimals);
             Assert.Equal(expected, result);
         }
+
+        // FromAtomic accepts amounts above long.MaxValue; required for high-divisibility CAs.
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData("1", 12, "0.000000000001")]
+        [InlineData("1000000000000", 12, "1.000000000000")]
+        [InlineData("10000000000000000000", 18, "10")]              // > long.MaxValue (10^19)
+        [InlineData("9999999999999999999999", 18, "9999.999999999999999999")]
+        [InlineData("100", 0, "100")]
+        public void FromAtomic_DecimalToDecimal_ReturnsExpectedValue(string atomicString, int decimals, string expectedString)
+        {
+            decimal atomic = decimal.Parse(atomicString, CultureInfo.InvariantCulture);
+            decimal expected = decimal.Parse(expectedString, CultureInfo.InvariantCulture);
+            decimal result = ZanoMoney.FromAtomic(atomic, decimals);
+            Assert.Equal(expected, result);
+        }
     }
 }

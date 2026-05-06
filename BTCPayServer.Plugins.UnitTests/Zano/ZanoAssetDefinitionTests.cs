@@ -70,6 +70,9 @@ namespace BTCPayServer.Plugins.UnitTests.Zano
         [InlineData("USDZ|" + ValidAssetId + "|99")]   // decimals out of range
         [InlineData("USDZ|" + ValidAssetId)]           // missing decimals
         [InlineData("|" + ValidAssetId + "|6")]        // empty ticker
+        [InlineData("USDZ|zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz|6")]  // 64 chars but not hex
+        [InlineData("USDZ|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg|6")]  // 'g' not in [0-9a-f]
+        [InlineData("USDZ|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde&|6")]  // query-special char
         public void ParseExtraAssets_Invalid_Throws(string raw)
         {
             Assert.Throws<FormatException>(() => ZanoAssetDefinition.ParseExtraAssets(raw));

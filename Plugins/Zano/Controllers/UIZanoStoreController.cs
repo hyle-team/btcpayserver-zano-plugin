@@ -134,7 +134,10 @@ namespace BTCPayServer.Plugins.Zano.Controllers
                 }
             });
 
-            blob.SetExcluded(PaymentTypes.CHAIN.GetPaymentMethodId(viewModel.CryptoCode), !viewModel.Enabled);
+            // Use the validated route cryptoCode, not viewModel.CryptoCode — the hidden
+            // form field can be tampered to point at a different Zano asset, which would
+            // toggle the wrong payment method while saving config under the route asset.
+            blob.SetExcluded(PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode), !viewModel.Enabled);
             storeData.SetStoreBlob(blob);
             await _storeRepository.UpdateStore(storeData);
             return RedirectToAction("GetStoreZanoPaymentMethod", new { cryptoCode });

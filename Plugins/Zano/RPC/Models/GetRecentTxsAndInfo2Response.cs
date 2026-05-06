@@ -29,7 +29,13 @@ namespace BTCPayServer.Plugins.Zano.RPC.Models
 
     public class ZanoSubtransfer
     {
-        [JsonProperty("amount")] public long Amount { get; set; }
+        // Atomic-unit amounts are represented as `decimal` rather than signed `long` because
+        // a 64-bit signed type can't hold valid Confidential-Asset amounts above
+        // ~9.22 atomic units when Decimals=18 (ZanoAssetDefinition allows decimals up to 18,
+        // making 10 units = 10^19 atomic, which exceeds long.MaxValue and would crash the
+        // entire poll cycle on JSON deserialization). decimal carries up to ~7.9e28, so any
+        // realistic CA amount fits with room to spare.
+        [JsonProperty("amount")] public decimal Amount { get; set; }
         [JsonProperty("asset_id")] public string AssetId { get; set; }
         [JsonProperty("is_income")] public bool IsIncome { get; set; }
     }

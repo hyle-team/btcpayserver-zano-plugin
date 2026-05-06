@@ -18,7 +18,20 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         public bool AllAvailable()
         {
-            return _zanoRpcProvider.Summaries.All(pair => pair.Value.DaemonAvailable);
+            // Match ZanoRpcProvider.IsAvailable: a network is ready only when its summary
+            // exists, the daemon reports synced (DaemonNetworkState == 2 sets Synced=true),
+            // and the wallet RPC is reachable. Empty Summaries means nothing has been
+            // polled yet — report unavailable so /api/v1/server/info doesn't claim
+            // fullySynched=true during plugin startup or when no Zano network is configured.
+            var configured = _zanoRpcProvider.DaemonRpcClients;
+            if (configured.Count == 0)
+            {
+                return false;
+            }
+            return configured.Keys.All(code =>
+                _zanoRpcProvider.Summaries.TryGetValue(code, out var s)
+                && s.Synced
+                && s.WalletAvailable);
         }
 
         public string Partial { get; } = "/Views/Zano/ZanoSyncSummary.cshtml";
@@ -27,7 +40,10 @@ namespace BTCPayServer.Plugins.Zano.Services
             return _zanoRpcProvider.Summaries.Select(pair => new ZanoSyncStatus()
             {
                 Summary = pair.Value,
-                PaymentMethodId = PaymentMethodId.Parse(pair.Key).ToString()
+                // Emit the canonical "ZANO-CHAIN" / "ZANO<ASSET>-CHAIN" form so API clients
+                // can correlate sync entries with supportedPaymentMethods. PaymentMethodId
+                // .Parse on a bare crypto code does not produce that form.
+                PaymentMethodId = PaymentTypes.CHAIN.GetPaymentMethodId(pair.Key).ToString()
             });
         }
     }

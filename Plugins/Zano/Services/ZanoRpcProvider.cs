@@ -8,6 +8,8 @@ using BTCPayServer.Plugins.Zano.Configuration;
 using BTCPayServer.Plugins.Zano.RPC;
 using BTCPayServer.Plugins.Zano.RPC.Models;
 
+using Microsoft.Extensions.Logging;
+
 namespace BTCPayServer.Plugins.Zano.Services
 {
     public class ZanoRpcProvider
@@ -21,18 +23,21 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         public ZanoRpcProvider(ZanoConfiguration zanoConfiguration,
             EventAggregator eventAggregator,
-            IHttpClientFactory httpClientFactory)
+            IHttpClientFactory httpClientFactory,
+            ILogger<JsonRpcClient> rpcLogger)
         {
             _zanoConfiguration = zanoConfiguration;
             _eventAggregator = eventAggregator;
             DaemonRpcClients =
                 _zanoConfiguration.ZanoConfigurationItems.ToImmutableDictionary(pair => pair.Key,
                     pair => new JsonRpcClient(pair.Value.DaemonRpcUri,
-                        httpClientFactory.CreateClient($"{pair.Key}client")));
+                        httpClientFactory.CreateClient($"{pair.Key}client"),
+                        rpcLogger));
             WalletRpcClients =
                 _zanoConfiguration.ZanoConfigurationItems.ToImmutableDictionary(pair => pair.Key,
                     pair => new JsonRpcClient(pair.Value.InternalWalletRpcUri,
-                        httpClientFactory.CreateClient($"{pair.Key}client")));
+                        httpClientFactory.CreateClient($"{pair.Key}client"),
+                        rpcLogger));
         }
 
         public bool IsConfigured(string cryptoCode) => WalletRpcClients.ContainsKey(cryptoCode) && DaemonRpcClients.ContainsKey(cryptoCode);

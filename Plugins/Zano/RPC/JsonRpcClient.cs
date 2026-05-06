@@ -5,6 +5,9 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 
@@ -12,13 +15,17 @@ namespace BTCPayServer.Plugins.Zano.RPC
 {
     public class JsonRpcClient
     {
+        private const int RawJsonPreviewMaxChars = 256;
+
         private readonly Uri _address;
         private readonly HttpClient _httpClient;
+        private readonly ILogger _logger;
 
-        public JsonRpcClient(Uri address, HttpClient client = null)
+        public JsonRpcClient(Uri address, HttpClient client = null, ILogger<JsonRpcClient> logger = null)
         {
             _address = address;
             _httpClient = client ?? new HttpClient();
+            _logger = logger ?? NullLogger<JsonRpcClient>.Instance;
         }
 
 
@@ -51,8 +58,17 @@ namespace BTCPayServer.Plugins.Zano.RPC
             }
             catch (Exception e)
             {
-                Console.WriteLine(e.Message);
-                Console.WriteLine(rawJson);
+                // Log a truncated, structured preview only — wallet RPC bodies can contain
+                // payment ids, tx hashes, amounts, asset ids, and history fragments, so we
+                // never dump the full payload to stdout.
+                var preview = rawJson is null
+                    ? "(null)"
+                    : (rawJson.Length > RawJsonPreviewMaxChars
+                        ? rawJson.Substring(0, RawJsonPreviewMaxChars) + "…"
+                        : rawJson);
+                _logger.LogError(e,
+                    "Failed to deserialize JSON-RPC response from {Endpoint} method={Method} previewLen={Length} preview={Preview}",
+                    _address, method, rawJson?.Length ?? 0, preview);
                 throw;
             }
 
