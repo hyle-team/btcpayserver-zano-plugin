@@ -126,26 +126,55 @@ namespace BTCPayServer.Plugins.Zano.Services
                 currentHeight = summary.CurrentHeight;
             }
 
-            // Collect all payment_ids from pending invoices
-            var expandedInvoices = invoices.Select(entity => (
-                    Invoice: entity,
-                    ExistingPayments: GetAllZanoPayments(entity, cryptoCode),
-                    Prompt: entity.GetPaymentPrompt(paymentMethodId),
-                    PaymentMethodDetails: handler.ParsePaymentPromptDetails(entity.GetPaymentPrompt(paymentMethodId).Details)))
+            // Collect all payment_ids from pending invoices.
+            //
+            // For each invoice we collect both the CURRENT prompt's payment_id AND the
+            // payment_ids of every Zano payment already recorded against the invoice.
+            // BTCPay re-activates the payment prompt (regenerating address + pid) after
+            // a payment is registered while Due is still being recomputed against the
+            // pre-AddPayment invoice snapshot. Without history, every subsequent poll
+            // would key off the new prompt pid and never re-match the already-recorded
+            // payment — its confirmations would stall at the value seen at first detection
+            // and the invoice would never reach Settled.
+            var expandedInvoices = invoices.Select(entity =>
+                {
+                    var existing = GetAllZanoPayments(entity, cryptoCode).ToList();
+                    var existingPids = existing
+                        .Select(p => handler.ParsePaymentDetails(p.Details)?.PaymentId)
+                        .Where(pid => !string.IsNullOrEmpty(pid))
+                        .ToList();
+                    var promptDetails = handler.ParsePaymentPromptDetails(entity.GetPaymentPrompt(paymentMethodId).Details);
+                    var allPids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (!string.IsNullOrEmpty(promptDetails.PaymentId))
+                    {
+                        allPids.Add(promptDetails.PaymentId);
+                    }
+                    foreach (var pid in existingPids)
+                    {
+                        allPids.Add(pid);
+                    }
+                    return (
+                        Invoice: entity,
+                        ExistingPayments: (IEnumerable<PaymentEntity>)existing,
+                        Prompt: entity.GetPaymentPrompt(paymentMethodId),
+                        PaymentMethodDetails: promptDetails,
+                        AllPaymentIds: allPids);
+                })
                 .ToList();
 
-            var paymentIds = expandedInvoices
-                .Select(e => e.PaymentMethodDetails.PaymentId)
-                .Where(pid => !string.IsNullOrEmpty(pid))
-                .Distinct()
-                .ToList();
+            var paymentIdSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in expandedInvoices)
+            {
+                foreach (var pid in e.AllPaymentIds)
+                {
+                    paymentIdSet.Add(pid);
+                }
+            }
 
-            if (!paymentIds.Any())
+            if (paymentIdSet.Count == 0)
             {
                 return;
             }
-
-            var paymentIdSet = new HashSet<string>(paymentIds, StringComparer.OrdinalIgnoreCase);
 
             // get_bulk_payments is native-ZANO-only: it ignores asset_id and returns
             // amount=0 for CA transfers. get_recent_txs_and_info2 is the canonical
@@ -280,7 +309,7 @@ namespace BTCPayServer.Plugins.Zano.Services
             foreach (var cand in dedupedCandidates)
             {
                 var matchingInvoice = expandedInvoices.FirstOrDefault(e =>
-                    string.Equals(e.PaymentMethodDetails.PaymentId, cand.PaymentId, StringComparison.OrdinalIgnoreCase) &&
+                    e.AllPaymentIds.Contains(cand.PaymentId) &&
                     (
                         string.IsNullOrEmpty(e.PaymentMethodDetails.AssetId) ||
                         string.IsNullOrEmpty(cand.AssetId) ||
