@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -35,6 +36,14 @@ namespace BTCPayServer.Plugins.Zano.Services
         private readonly InvoiceActivator _invoiceActivator;
         private readonly PaymentService _paymentService;
 
+        // One SemaphoreSlim(1,1) per crypto code, lazy-initialized on first use.
+        // Serializes UpdateAnyPendingZanoPayment so the regular poll (ZanoPollEvent)
+        // and the availability-triggered scan (ZanoDaemonStateChange) can't run
+        // against the same wallet concurrently. The fire-and-forget on state change
+        // used to overlap with the poller, costing duplicate RPC and racing on the
+        // shared updatedPaymentEntities list inside UpdatePaymentStates.
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _scanSemaphores = new(StringComparer.OrdinalIgnoreCase);
+
         public ZanoListener(InvoiceRepository invoiceRepository,
             EventAggregator eventAggregator,
             ZanoRpcProvider zanoRpcProvider,
@@ -70,7 +79,11 @@ namespace BTCPayServer.Plugins.Zano.Services
                 if (_zanoRpcProvider.IsAvailable(stateChange.CryptoCode))
                 {
                     _logger.LogInformation("{CryptoCode} just became available", stateChange.CryptoCode);
-                    _ = UpdateAnyPendingZanoPayment(stateChange.CryptoCode);
+                    // Awaited (was fire-and-forget): exceptions are now observable
+                    // via the base ProcessEvent error handling, and the per-crypto
+                    // semaphore in UpdateAnyPendingZanoPayment prevents overlap
+                    // with the regular ZanoPollEvent scan.
+                    await UpdateAnyPendingZanoPayment(stateChange.CryptoCode, cancellationToken);
                 }
                 else
                 {
@@ -81,7 +94,7 @@ namespace BTCPayServer.Plugins.Zano.Services
             {
                 if (_zanoRpcProvider.IsAvailable(pollEvent.CryptoCode))
                 {
-                    await UpdateAnyPendingZanoPayment(pollEvent.CryptoCode);
+                    await UpdateAnyPendingZanoPayment(pollEvent.CryptoCode, cancellationToken);
                 }
             }
         }
@@ -107,7 +120,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                 new InvoiceEvent(invoice, InvoiceEvent.ReceivedPayment) { Payment = payment });
         }
 
-        private async Task UpdatePaymentStates(string cryptoCode, InvoiceEntity[] invoices)
+        private async Task UpdatePaymentStates(string cryptoCode, InvoiceEntity[] invoices, CancellationToken cancellationToken)
         {
             if (!invoices.Any())
             {
@@ -204,7 +217,8 @@ namespace BTCPayServer.Plugins.Zano.Services
                             Offset = offset,
                             Count = PageSize,
                             UpdateProvisionInfo = false
-                        });
+                        },
+                        cancellationToken);
                 }
                 catch (Exception ex)
                 {
@@ -488,16 +502,25 @@ namespace BTCPayServer.Plugins.Zano.Services
                 })
                 .ToList();
 
-        private async Task UpdateAnyPendingZanoPayment(string cryptoCode)
+        private async Task UpdateAnyPendingZanoPayment(string cryptoCode, CancellationToken cancellationToken)
         {
-            var paymentMethodId = PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode);
-            var invoices = await _invoiceRepository.GetMonitoredInvoices(paymentMethodId);
-            if (!invoices.Any())
+            var sem = _scanSemaphores.GetOrAdd(cryptoCode, _ => new SemaphoreSlim(1, 1));
+            await sem.WaitAsync(cancellationToken);
+            try
             {
-                return;
+                var paymentMethodId = PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode);
+                var invoices = await _invoiceRepository.GetMonitoredInvoices(paymentMethodId);
+                if (!invoices.Any())
+                {
+                    return;
+                }
+                invoices = invoices.Where(entity => entity.GetPaymentPrompt(paymentMethodId)?.Activated is true).ToArray();
+                await UpdatePaymentStates(cryptoCode, invoices, cancellationToken);
             }
-            invoices = invoices.Where(entity => entity.GetPaymentPrompt(paymentMethodId)?.Activated is true).ToArray();
-            await UpdatePaymentStates(cryptoCode, invoices);
+            finally
+            {
+                sem.Release();
+            }
         }
 
         private IEnumerable<PaymentEntity> GetAllZanoPayments(InvoiceEntity invoice, string cryptoCode)
