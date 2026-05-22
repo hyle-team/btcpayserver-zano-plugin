@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -17,6 +18,33 @@ namespace BTCPayServer.Plugins.Zano.RPC
     {
         private const int RawJsonPreviewMaxChars = 256;
 
+        // Per-method timeouts: HttpClient's default of 100s is too long for a wedged
+        // local daemon — a single bad call used to stall a poll for nearly two minutes.
+        // Fast methods (status/health probes) should fail much sooner so the summary
+        // updater and listener stay responsive; the wallet-history paging call gets a
+        // longer budget because a large recent-tx page can legitimately take a few
+        // seconds on a busy wallet.
+        private static readonly TimeSpan FastMethodTimeout = TimeSpan.FromSeconds(10);
+        private static readonly TimeSpan SlowMethodTimeout = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan DefaultMethodTimeout = TimeSpan.FromSeconds(30);
+
+        private static readonly HashSet<string> FastMethods = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "getinfo",
+            "get_wallet_info"
+        };
+
+        private static readonly HashSet<string> SlowMethods = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "get_recent_txs_and_info2"
+        };
+
+        // Transient failures (network blips, daemon restarts) get up to two retries
+        // with exponential backoff. Application errors (JsonRpcApiException) and
+        // malformed responses bypass retry — they're not going to fix themselves.
+        private const int MaxRetries = 2;
+        private static readonly TimeSpan BaseRetryDelay = TimeSpan.FromMilliseconds(200);
+
         private readonly Uri _address;
         private readonly HttpClient _httpClient;
         private readonly ILogger _logger;
@@ -28,9 +56,47 @@ namespace BTCPayServer.Plugins.Zano.RPC
             _logger = logger ?? NullLogger<JsonRpcClient>.Instance;
         }
 
+        private static TimeSpan TimeoutFor(string method) =>
+            FastMethods.Contains(method) ? FastMethodTimeout
+            : SlowMethods.Contains(method) ? SlowMethodTimeout
+            : DefaultMethodTimeout;
 
         public async Task<TResponse> SendCommandAsync<TRequest, TResponse>(string method, TRequest data,
             CancellationToken cts = default)
+        {
+            var timeout = TimeoutFor(method);
+            for (int attempt = 0; ; attempt++)
+            {
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cts);
+                timeoutCts.CancelAfter(timeout);
+                try
+                {
+                    return await SendCommandOnceAsync<TRequest, TResponse>(method, data, timeoutCts.Token);
+                }
+                catch (JsonRpcApiException)
+                {
+                    // Application-level error — the daemon answered, we just didn't
+                    // like the answer. Retrying won't help.
+                    throw;
+                }
+                catch (OperationCanceledException) when (cts.IsCancellationRequested)
+                {
+                    // Caller cancellation propagates immediately.
+                    throw;
+                }
+                catch (Exception ex) when (!cts.IsCancellationRequested && IsTransient(ex) && attempt < MaxRetries)
+                {
+                    var delay = TimeSpan.FromMilliseconds(BaseRetryDelay.TotalMilliseconds * (1L << attempt));
+                    _logger.LogWarning(
+                        "Transient JSON-RPC failure on {Endpoint} method={Method} attempt={Attempt}/{MaxRetries}, retrying in {DelayMs}ms: {Error}",
+                        _address, method, attempt + 1, MaxRetries, delay.TotalMilliseconds, ex.GetType().Name);
+                    await Task.Delay(delay, cts);
+                }
+            }
+        }
+
+        private async Task<TResponse> SendCommandOnceAsync<TRequest, TResponse>(string method, TRequest data,
+            CancellationToken cts)
         {
             var jsonSerializer = new JsonSerializerSettings
             {
@@ -49,18 +115,18 @@ namespace BTCPayServer.Plugins.Zano.RPC
 
             HttpResponseMessage rawResult = await _httpClient.SendAsync(httpRequest, cts);
             rawResult.EnsureSuccessStatusCode();
-            var rawJson = await rawResult.Content.ReadAsStringAsync();
+            var rawJson = await rawResult.Content.ReadAsStringAsync(cts);
 
             JsonRpcResult<TResponse> response;
             try
             {
                 response = JsonConvert.DeserializeObject<JsonRpcResult<TResponse>>(rawJson, jsonSerializer);
             }
-            catch (Exception e)
+            catch (JsonException e)
             {
                 // Log a truncated, structured preview only — wallet RPC bodies can contain
                 // payment ids, tx hashes, amounts, asset ids, and history fragments, so we
-                // never dump the full payload to stdout.
+                // never dump the full payload to stdout. Malformed JSON is not retried.
                 var preview = rawJson is null
                     ? "(null)"
                     : (rawJson.Length > RawJsonPreviewMaxChars
@@ -82,6 +148,13 @@ namespace BTCPayServer.Plugins.Zano.RPC
 
             return response.Result;
         }
+
+        // Transient = network/connectivity issue or per-call timeout expiry. Caller
+        // cancellation is filtered out at the call site so it never reaches here.
+        private static bool IsTransient(Exception ex) =>
+            ex is HttpRequestException
+            || ex is TaskCanceledException
+            || ex is OperationCanceledException;
 
         public class NoRequestModel
         {
