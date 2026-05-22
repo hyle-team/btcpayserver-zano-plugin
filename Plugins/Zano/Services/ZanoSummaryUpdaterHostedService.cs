@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -35,10 +36,19 @@ namespace BTCPayServer.Plugins.Zano.Services
         public Task StartAsync(CancellationToken cancellationToken)
         {
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            // Summary updates stay per crypto code because each network can in principle
+            // point at a different daemon URI (even though every CA today shares native
+            // ZANO's wallet, the daemon URI is configured separately).
             foreach (var configItem in _zanoConfiguration.ZanoConfigurationItems)
             {
                 _ = StartSummaryLoop(_cts.Token, configItem.Key);
-                _ = StartPollingLoop(_cts.Token, configItem.Key);
+            }
+            // Polling is consolidated per wallet URI: one ZanoWalletPollEvent per wallet
+            // per tick, which the listener handles with a single get_recent_txs_and_info2
+            // fanned out across every network in the group.
+            foreach (var walletGroup in _zanoConfiguration.GroupByWallet())
+            {
+                _ = StartWalletPollLoop(_cts.Token, walletGroup);
             }
             return Task.CompletedTask;
         }
@@ -75,24 +85,31 @@ namespace BTCPayServer.Plugins.Zano.Services
             }
         }
 
-        private async Task StartPollingLoop(CancellationToken cancellation, string cryptoCode)
+        private async Task StartWalletPollLoop(CancellationToken cancellation, ZanoWalletGroup walletGroup)
         {
-            Logs.PayServer.LogInformation("Starting Zano payment polling loop ({CryptoCode})", cryptoCode);
+            Logs.PayServer.LogInformation(
+                "Starting Zano payment polling loop (wallet {WalletKey}, networks {CryptoCodes})",
+                walletGroup.WalletKey, string.Join(",", walletGroup.CryptoCodes));
             try
             {
                 while (!cancellation.IsCancellationRequested)
                 {
                     try
                     {
-                        if (_zanoRpcProvider.IsAvailable(cryptoCode))
+                        if (AnyAvailable(walletGroup.CryptoCodes))
                         {
-                            _eventAggregator.Publish(new ZanoPollEvent { CryptoCode = cryptoCode });
+                            _eventAggregator.Publish(new ZanoWalletPollEvent
+                            {
+                                WalletKey = walletGroup.WalletKey,
+                                CryptoCodes = walletGroup.CryptoCodes
+                            });
                         }
                         await Task.Delay(TimeSpan.FromSeconds(15), cancellation);
                     }
                     catch (Exception ex) when (!cancellation.IsCancellationRequested)
                     {
-                        Logs.PayServer.LogError(ex, "Unhandled exception in polling loop ({CryptoCode})", cryptoCode);
+                        Logs.PayServer.LogError(ex,
+                            "Unhandled exception in polling loop (wallet {WalletKey})", walletGroup.WalletKey);
                         await Task.Delay(TimeSpan.FromSeconds(15), cancellation);
                     }
                 }
@@ -101,6 +118,18 @@ namespace BTCPayServer.Plugins.Zano.Services
             {
                 // ignored
             }
+        }
+
+        private bool AnyAvailable(IReadOnlyList<string> cryptoCodes)
+        {
+            foreach (var code in cryptoCodes)
+            {
+                if (_zanoRpcProvider.IsAvailable(code))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         public Task StopAsync(CancellationToken cancellationToken)
