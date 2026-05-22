@@ -50,8 +50,15 @@ namespace BTCPayServer.Plugins.Zano.Payments
                 context.Model.RequiredConfirmations = (int)ZanoListener.ConfirmationsRequired(details, context.InvoiceEntity.SpeedPolicy);
             }
 
+            // Two URL formats. The link button uses the canonical Zano deeplink
+            // (zano:action=send&...) which both Zano wallets understand. The QR
+            // encodes the BIP21 form (zano:{addr}?tx_amount=...) which Cake/Edge/
+            // Bitcoin.com all parse in their internal QR scanners; the canonical
+            // form would only work for the Zano wallets there.
             context.Model.InvoiceBitcoinUrl = paymentLinkExtension.GetPaymentLink(context.Prompt, context.UrlHelper);
-            context.Model.InvoiceBitcoinUrlQR = context.Model.InvoiceBitcoinUrl;
+            context.Model.InvoiceBitcoinUrlQR = paymentLinkExtension is ZanoPaymentLinkExtension zLink
+                ? zLink.GetCakePaymentLink(context.Prompt)
+                : context.Model.InvoiceBitcoinUrl;
         }
     }
 }
