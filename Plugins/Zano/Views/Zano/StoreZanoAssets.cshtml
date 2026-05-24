@@ -1,0 +1,58 @@
+@using StoreZanoAssetsViewModel = BTCPayServer.Plugins.Zano.Controllers.UIZanoStoreController.StoreZanoAssetsViewModel
+@using StoreZanoAssetRow = BTCPayServer.Plugins.Zano.Controllers.UIZanoStoreController.StoreZanoAssetRow
+@model StoreZanoAssetsViewModel
+
+@{
+    ViewData.SetActivePage("ZanoAssets", "Zano assets", "ZanoAssets");
+    Layout = "_Layout";
+}
+
+<partial name="_StatusMessage" />
+
+<div class="row">
+    <div class="col-md-8">
+        <h3>Zano assets</h3>
+        <p class="text-secondary">
+            Pick which Zano networks this store accepts. Anything left unticked is
+            hidden from invoices and the per-method config page. Native ZANO and
+            each Confidential Asset registered via <code>BTCPAY_ZANO_EXTRA_ASSETS</code>
+            shows up here.
+        </p>
+
+        @if (!Model.Rows.Any())
+        {
+            <div class="alert alert-info">
+                No Zano networks are configured on this server.
+            </div>
+        }
+        else
+        {
+            <form method="post" asp-action="StoreZanoAssets">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Enabled</th>
+                            <th>Crypto code</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var row in Model.Rows)
+                        {
+                            <tr>
+                                <td>
+                                    <input type="checkbox"
+                                           name="WhitelistedCryptoCodes"
+                                           value="@row.CryptoCode"
+                                           checked="@row.Enabled"
+                                           class="form-check-input" />
+                                </td>
+                                <td>@row.CryptoCode</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                <button type="submit" class="btn btn-primary" id="SaveAssetWhitelist">Save</button>
+            </form>
+        }
+    </div>
+</div>

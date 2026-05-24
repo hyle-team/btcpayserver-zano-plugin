@@ -18,24 +18,50 @@
     var store = Context.GetStoreData();
     var excludeFilters = store.GetStoreBlob().GetExcludedPaymentMethods();
 
+    var routeController = ViewContext.RouteData.Values.TryGetValue("Controller", out var rcVal) ? rcVal?.ToString() : null;
+    var routeAction = ViewContext.RouteData.Values.TryGetValue("Action", out var raVal) ? raVal?.ToString() : null;
+    var assetsActive = !string.IsNullOrEmpty(storeId)
+        && routeController != null
+        && nameof(UIZanoStoreController).StartsWith(routeController, StringComparison.InvariantCultureIgnoreCase)
+        && string.Equals(routeAction, nameof(UIZanoStoreController.StoreZanoAssets), StringComparison.OrdinalIgnoreCase);
+
+    <li class="nav-item">
+        <a class="nav-link @(assetsActive ? "active" : "")"
+           asp-route-storeId="@storeId"
+           asp-action="StoreZanoAssets"
+           asp-controller="UIZanoStore">
+            <span>Zano assets</span>
+        </a>
+    </li>
+
     foreach (var configItem in ZanoConfiguration.ZanoConfigurationItems)
     {
         var cryptoCode = configItem.Key;
         var pmi = PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode);
+        // Whitelist gates visibility: a CA the store has excluded never shows up
+        // as a per-method nav entry. The assets page is always reachable so the
+        // merchant can re-enable it.
+        if (excludeFilters.Match(pmi))
+        {
+            continue;
+        }
         var settings = store.GetPaymentMethodConfigs(Handlers)
             .Where(s => s.Value is ZanoPaymentPromptDetails && s.Key == pmi)
             .Select(s => s.Value)
             .SingleOrDefault();
-        var enabled = settings != null && !excludeFilters.Match(pmi);
+        var enabled = settings != null;
 
         var network = NetworkProvider.GetNetwork(cryptoCode) as ZanoSpecificBtcPayNetwork;
         var label = network?.IsNative == true
             ? "Zano"
             : (network?.DisplayName ?? cryptoCode) + " (Zano)";
 
-        var isActive = !string.IsNullOrEmpty(storeId) && ViewContext.RouteData.Values.TryGetValue("Controller", out var controller) && controller is not null &&
-                       nameof(UIZanoStoreController).StartsWith(controller.ToString() ?? string.Empty, StringComparison.InvariantCultureIgnoreCase) &&
-                       ViewContext.RouteData.Values.TryGetValue("cryptoCode", out var routeCryptoCode) && routeCryptoCode is not null && routeCryptoCode.ToString() == cryptoCode;
+        var isActive = !string.IsNullOrEmpty(storeId)
+                       && routeController != null
+                       && nameof(UIZanoStoreController).StartsWith(routeController, StringComparison.InvariantCultureIgnoreCase)
+                       && ViewContext.RouteData.Values.TryGetValue("cryptoCode", out var routeCryptoCode)
+                       && routeCryptoCode is not null
+                       && routeCryptoCode.ToString() == cryptoCode;
         <li class="nav-item">
             <a class="nav-link @(isActive ? "active" : "")"
                asp-route-cryptoCode="@cryptoCode"
