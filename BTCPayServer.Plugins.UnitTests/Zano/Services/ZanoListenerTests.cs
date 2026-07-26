@@ -1,5 +1,9 @@
+using System;
+using System.Collections.Generic;
+
 using BTCPayServer.Client.Models;
 using BTCPayServer.Plugins.Zano.Payments;
+using BTCPayServer.Plugins.Zano.RPC.Models;
 using BTCPayServer.Plugins.Zano.Services;
 
 using Xunit;
@@ -250,6 +254,73 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             var result = ZanoListener.AggregateCandidates(input);
             Assert.Single(result);
             Assert.Equal(10_000_000_000_000_000_000m, result[0].Amount);
+        }
+
+        // Page-overlap guard: the same confirmed tx returned on two adjacent pages (growing
+        // history shifts the newest-first window) must collapse to ONE row, so
+        // AggregateCandidates does not sum the duplicate and double-credit the payment.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void DedupTransferRows_CollapsesDuplicateTxRows()
+        {
+            static ZanoTransfer Row() => new()
+            {
+                TxHash = "tx1",
+                Height = 13975,
+                SubtransfersByPid = new List<ZanoPaymentIdGroup>
+                {
+                    new() { PaymentId = "pid1", Subtransfers = new List<ZanoSubtransfer> { new() { Amount = 100m, AssetId = "a", IsIncome = true } } }
+                }
+            };
+            var result = ZanoListener.DedupTransferRows(new[] { Row(), Row() });
+            Assert.Single(result);
+            Assert.Equal("tx1", result[0].TxHash);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void DedupTransferRows_KeepsConfirmedOverMempoolForSameTx()
+        {
+            static ZanoTransfer Row(long h) => new() { TxHash = "tx1", Height = h, SubtransfersByPid = new List<ZanoPaymentIdGroup>() };
+            var result = ZanoListener.DedupTransferRows(new[] { Row(0), Row(13975) });
+            Assert.Single(result);
+            Assert.Equal(13975L, result[0].Height);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void DedupTransferRows_KeepsDistinctTxs()
+        {
+            static ZanoTransfer Row(string h) => new() { TxHash = h, Height = 1, SubtransfersByPid = new List<ZanoPaymentIdGroup>() };
+            var result = ZanoListener.DedupTransferRows(new[] { Row("tx1"), Row("tx2") });
+            Assert.Equal(2, result.Count);
+        }
+
+        // A mempool (BlockHeight==0) transfer carrying a future height-form unlock_time must
+        // NOT settle even under HighSpeed/0-conf: the output is locked until a future block,
+        // and ConfirmationsRequired can't express that while unconfirmed.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void GetStatus_HeightLockedMempool_StaysProcessing()
+        {
+            var details = new ZanoPaymentData
+            {
+                BlockHeight = 0,
+                ConfirmationCount = 0,
+                LockTime = 13985,
+                InvoiceSettledConfirmationThreshold = 0
+            };
+            Assert.True(ZanoListener.IsHeightLockedUnconfirmed(details));
+            Assert.False(ZanoListener.GetStatus(details, SpeedPolicy.HighSpeed, nowUnixSeconds: 1_700_000_000L));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsHeightLockedUnconfirmed_ConfirmedOrTimestampOrNoLock_IsFalse()
+        {
+            Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 13975, LockTime = 13985 }));       // confirmed
+            Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 0, LockTime = 0 }));               // no lock
+            Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 0, LockTime = 1_700_000_000L }));  // timestamp form
         }
     }
 }

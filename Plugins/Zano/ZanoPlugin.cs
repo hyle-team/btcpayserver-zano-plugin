@@ -127,17 +127,24 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
         {
             return Array.Empty<ZanoAssetDefinition>();
         }
-        try
-        {
-            return ZanoAssetDefinition.ParseExtraAssets(raw);
-        }
-        catch (FormatException ex)
+
+        // Resilient parse: skip only the invalid entries and keep the valid ones, so a typo
+        // in one newly added asset can't disable every other CA (and stop polling their
+        // outstanding invoices) on restart.
+        var result = ZanoAssetDefinition.ParseExtraAssetsResilient(raw);
+        if (result.Errors.Count > 0)
         {
             var loggerFactory = pluginServices.BootstrapServices.GetService<ILoggerFactory>();
             var logger = loggerFactory?.CreateLogger<ZanoPlugin>();
-            logger?.LogError(ex, "BTCPAY_ZANO_EXTRA_ASSETS is malformed; extra assets disabled: {Message}", ex.Message);
-            return Array.Empty<ZanoAssetDefinition>();
+            foreach (var err in result.Errors)
+            {
+                logger?.LogError("BTCPAY_ZANO_EXTRA_ASSETS: skipped an invalid entry — {Error}", err);
+            }
+            logger?.LogWarning(
+                "BTCPAY_ZANO_EXTRA_ASSETS: {Skipped} invalid entry(ies) skipped, {Kept} valid asset(s) registered.",
+                result.Errors.Count, result.Assets.Count);
         }
+        return result.Assets;
     }
 
     class SimpleTransactionLinkProvider : DefaultTransactionLinkProvider

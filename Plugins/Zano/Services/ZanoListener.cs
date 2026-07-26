@@ -199,7 +199,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     return;
                 }
 
-                var allTransfers = await FetchWalletTransfersAsync(
+                var (allTransfers, scanComplete) = await FetchWalletTransfersAsync(
                     walletRpcClient, walletClientCryptoCode, allPaymentIds, cancellationToken);
                 if (allTransfers.Count == 0)
                 {
@@ -211,7 +211,7 @@ namespace BTCPayServer.Plugins.Zano.Services
 
                 foreach (var ctx in perCrypto)
                 {
-                    await ProcessTransfersForCryptoAsync(ctx, allTransfers);
+                    await ProcessTransfersForCryptoAsync(ctx, allTransfers, scanComplete);
                 }
             }
             finally
@@ -289,7 +289,13 @@ namespace BTCPayServer.Plugins.Zano.Services
         // Because the wallet's history is the same regardless of which crypto in
         // the group we asked through, a single call here serves every network in
         // the wallet group — the per-network filtering happens afterwards.
-        private async Task<List<ZanoTransfer>> FetchWalletTransfersAsync(
+        // Returns the wallet transfer rows plus whether the scan was COMPLETE. Complete means
+        // it ended by locating every monitored payment id or by exhausting the wallet history
+        // — i.e. absence of a payment from the result is trustworthy. Incomplete means it hit
+        // the page cap or an RPC error, so absence proves nothing and must NOT feed
+        // drop-detection. Caller cancellation propagates rather than masquerading as an
+        // empty/partial history.
+        private async Task<(List<ZanoTransfer> Transfers, bool Complete)> FetchWalletTransfersAsync(
             JsonRpcClient walletRpcClient,
             string logCryptoCode,
             HashSet<string> paymentIdSet,
@@ -300,6 +306,7 @@ namespace BTCPayServer.Plugins.Zano.Services
             var allTransfers = new List<ZanoTransfer>();
             var matchedPaymentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int offset = 0;
+            bool complete = false;
             for (int page = 0; page < MaxPages; page++)
             {
                 GetRecentTxsAndInfo2Response result;
@@ -315,16 +322,25 @@ namespace BTCPayServer.Plugins.Zano.Services
                         },
                         cancellationToken);
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // Shutdown/cancellation is not "history exhausted" — propagate so the
+                    // caller aborts instead of treating a partial prefix as authoritative.
+                    throw;
+                }
                 catch (Exception ex)
                 {
+                    // RPC failure mid-paging: hand back what we have but mark INCOMPLETE so
+                    // drop-detection does not read "absent" as "dropped".
                     _logger.LogError(ex,
                         "Failed to query recent txs via {CryptoCode} client at offset {Offset}",
                         logCryptoCode, offset);
-                    return allTransfers;
+                    return (DedupTransferRows(allTransfers), false);
                 }
 
                 if (result?.Transfers == null || result.Transfers.Count == 0)
                 {
+                    complete = true; // history exhausted
                     break;
                 }
 
@@ -347,17 +363,33 @@ namespace BTCPayServer.Plugins.Zano.Services
 
                 if (matchedPaymentIds.Count >= paymentIdSet.Count)
                 {
+                    complete = true; // every monitored payment id located
                     break;
                 }
                 if (result.Transfers.Count < PageSize)
                 {
+                    complete = true; // history exhausted
                     break;
                 }
                 offset += PageSize;
+                // Falling out of the loop via MaxPages leaves complete=false: the history is
+                // deeper than our cap and some monitored payment id is still unseen.
             }
 
-            return allTransfers;
+            return (DedupTransferRows(allTransfers), complete);
         }
+
+        // Page-overlap guard: get_recent_txs_and_info2 pages newest-first by offset over a
+        // growing history, so a tx near a page boundary can be returned on two consecutive
+        // pages. AggregateCandidates SUMS same-(tx,pid,asset,height) legs — legitimate for a
+        // multi-output payment within one tx — so a duplicated transfer ROW would double the
+        // recorded amount. Collapse to one row per tx_hash, keeping the highest-height
+        // instance (which also folds a mempool row into its later confirmed row).
+        public static List<ZanoTransfer> DedupTransferRows(IEnumerable<ZanoTransfer> transfers)
+            => transfers
+                .GroupBy(t => t.TxHash ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.OrderByDescending(t => t.Height).First())
+                .ToList();
 
         // Per-crypto candidate filtering and payment publication. Runs against the
         // wallet-level transfers already fetched by FetchWalletTransfersAsync; the
@@ -367,7 +399,8 @@ namespace BTCPayServer.Plugins.Zano.Services
         // payments.
         private async Task ProcessTransfersForCryptoAsync(
             CryptoScanContext ctx,
-            List<ZanoTransfer> allTransfers)
+            List<ZanoTransfer> allTransfers,
+            bool scanComplete)
         {
             long currentHeight = 0;
             if (_zanoRpcProvider.Summaries.TryGetValue(ctx.CryptoCode, out var summary))
@@ -434,11 +467,13 @@ namespace BTCPayServer.Plugins.Zano.Services
                     continue;
                 }
 
-                // Clamp ≥ 0: a chain reorg can briefly drop currentHeight below
-                // cand.Height, which would otherwise produce a negative confirmation
-                // count and a nonsense status decision.
+                // Confirmations = chain size − inclusion height. getinfo.height is the
+                // blockchain SIZE (top block index + 1) and cand.Height is the tx's 0-based
+                // inclusion height, so a tx in the tip block has (size − height) = 1. The
+                // old "+ 1" over-counted by one and settled ≥2-conf policies a block early.
+                // Clamp ≥ 0: a brief reorg can drop currentHeight below cand.Height.
                 long confirmations = cand.Height > 0 && currentHeight > 0
-                    ? Math.Max(0L, currentHeight - cand.Height + 1)
+                    ? Math.Max(0L, currentHeight - cand.Height)
                     : 0;
 
                 _logger.LogInformation(
@@ -467,41 +502,48 @@ namespace BTCPayServer.Plugins.Zano.Services
             // (~75s at the default 15s poll interval) flip an already-Settled invoice
             // back to Processing so the merchant sees the wallet evidence is gone.
             //
+            // GATED ON scanComplete: on a capped/failed/cancelled scan, "absent" only means
+            // "we didn't look far enough", not "dropped". Counting those as misses would
+            // down-count a valid but aged-out payment. We only treat absence as evidence
+            // when the scan located every monitored payment id or exhausted the history.
             // The wallet-empty case (allTransfers.Count == 0) is filtered upstream so
             // a wallet outage doesn't increment counters. A payment that re-appears
             // (e.g. wallet rescan) is matched by HandlePaymentData, which rewrites
             // Details from scratch and resets MissingPollCount to its 0 default.
-            var matchedKeys = new HashSet<string>(
-                dedupedCandidates.Select(c => DropDetectionKey(c.TxHash, c.PaymentId, c.AssetId)),
-                StringComparer.OrdinalIgnoreCase);
-
-            foreach (var invoiceCtx in ctx.ExpandedInvoices)
+            if (scanComplete)
             {
-                foreach (var existing in invoiceCtx.ExistingPayments)
-                {
-                    var existingDetails = ctx.Handler.ParsePaymentDetails(existing.Details);
-                    if (existingDetails == null)
-                    {
-                        continue;
-                    }
-                    var key = DropDetectionKey(existingDetails.TransactionId, existingDetails.PaymentId, existingDetails.AssetId);
-                    if (matchedKeys.Contains(key))
-                    {
-                        continue;
-                    }
+                var matchedKeys = new HashSet<string>(
+                    dedupedCandidates.Select(c => DropDetectionKey(c.TxHash, c.PaymentId, c.AssetId)),
+                    StringComparer.OrdinalIgnoreCase);
 
-                    existingDetails.MissingPollCount++;
-                    var shouldFlip = existingDetails.MissingPollCount >= DropDetectionThreshold
-                                     && existing.Status == PaymentStatus.Settled;
-                    if (shouldFlip)
+                foreach (var invoiceCtx in ctx.ExpandedInvoices)
+                {
+                    foreach (var existing in invoiceCtx.ExistingPayments)
                     {
-                        existing.Status = PaymentStatus.Processing;
-                        _logger.LogWarning(
-                            "Zano drop-detection: flipping Settled→Processing for invoice {InvoiceId} pid={Pid} tx={Tx} after {Threshold} missing polls",
-                            invoiceCtx.Invoice.Id, existingDetails.PaymentId, existingDetails.TransactionId, DropDetectionThreshold);
+                        var existingDetails = ctx.Handler.ParsePaymentDetails(existing.Details);
+                        if (existingDetails == null)
+                        {
+                            continue;
+                        }
+                        var key = DropDetectionKey(existingDetails.TransactionId, existingDetails.PaymentId, existingDetails.AssetId);
+                        if (matchedKeys.Contains(key))
+                        {
+                            continue;
+                        }
+
+                        existingDetails.MissingPollCount++;
+                        var shouldFlip = existingDetails.MissingPollCount >= DropDetectionThreshold
+                                         && existing.Status == PaymentStatus.Settled;
+                        if (shouldFlip)
+                        {
+                            existing.Status = PaymentStatus.Processing;
+                            _logger.LogWarning(
+                                "Zano drop-detection: flipping Settled→Processing for invoice {InvoiceId} pid={Pid} tx={Tx} after {Threshold} missing polls",
+                                invoiceCtx.Invoice.Id, existingDetails.PaymentId, existingDetails.TransactionId, DropDetectionThreshold);
+                        }
+                        existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
+                        updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
                     }
-                    existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
-                    updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
                 }
             }
 
@@ -583,7 +625,18 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         public static bool GetStatus(ZanoPaymentData details, SpeedPolicy speedPolicy, long nowUnixSeconds)
             => !IsTimestampLocked(details, nowUnixSeconds)
+               && !IsHeightLockedUnconfirmed(details)
                && ConfirmationsRequired(details, speedPolicy) <= details.ConfirmationCount;
+
+        // A height-form unlock_time on a still-unconfirmed (mempool, BlockHeight==0) transfer
+        // can't be proven satisfied: ConfirmationsRequired deliberately ignores the height
+        // lockExtra while BlockHeight==0, so without this gate a HighSpeed/0-conf invoice
+        // would settle on an output that is locked until an arbitrary future block. Once the
+        // tx confirms (BlockHeight>0) the lockExtra path in ConfirmationsRequired takes over.
+        public static bool IsHeightLockedUnconfirmed(ZanoPaymentData details)
+            => details.LockTime > 0
+               && details.LockTime < ZanoBlockHeightTimestampThreshold
+               && details.BlockHeight == 0;
 
         // Zano `unlock_time` semantics (mirrors CryptoNote):
         //   0                 → output unlocked from the moment the tx is mined

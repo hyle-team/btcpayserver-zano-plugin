@@ -45,6 +45,21 @@ namespace BTCPayServer.Plugins.Zano.RPC
         private const int MaxRetries = 2;
         private static readonly TimeSpan BaseRetryDelay = TimeSpan.FromMilliseconds(200);
 
+        // Retry is allow-listed to methods that are safe to repeat. A response-read timeout
+        // AFTER the daemon already applied a state-changing call (e.g. a future `transfer`)
+        // must never be retried — that risks a double-spend. Idempotent reads/status and
+        // deterministic integrated-address generation are safe to replay; anything not listed
+        // here surfaces the transient error to the caller instead of being retried blindly.
+        private static readonly HashSet<string> RetryableMethods = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "getinfo",
+            "get_wallet_info",
+            "get_recent_txs_and_info2",
+            "get_asset_info",
+            "make_integrated_address",
+            "open_wallet"
+        };
+
         private readonly Uri _address;
         private readonly HttpClient _httpClient;
         private readonly ILogger _logger;
@@ -84,7 +99,7 @@ namespace BTCPayServer.Plugins.Zano.RPC
                     // Caller cancellation propagates immediately.
                     throw;
                 }
-                catch (Exception ex) when (!cts.IsCancellationRequested && IsTransient(ex) && attempt < MaxRetries)
+                catch (Exception ex) when (!cts.IsCancellationRequested && IsTransient(ex) && attempt < MaxRetries && RetryableMethods.Contains(method))
                 {
                     var delay = TimeSpan.FromMilliseconds(BaseRetryDelay.TotalMilliseconds * (1L << attempt));
                     _logger.LogWarning(
