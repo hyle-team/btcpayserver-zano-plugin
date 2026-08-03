@@ -49,91 +49,126 @@ public class ZanoAssetDefinition
         };
     }
 
+    // Strict parse: throws FormatException on the first invalid row or duplicate. Kept for
+    // callers/tests that want fail-fast validation of a single known-good config string.
     public static IReadOnlyList<ZanoAssetDefinition> ParseExtraAssets(string raw)
     {
+        var result = ParseExtraAssetsResilient(raw);
+        if (result.Errors.Count > 0)
+        {
+            throw new FormatException(result.Errors[0]);
+        }
+        return result.Assets;
+    }
+
+    public sealed record ExtraAssetsParseResult(
+        IReadOnlyList<ZanoAssetDefinition> Assets,
+        IReadOnlyList<string> Errors);
+
+    // Resilient parse: an invalid row is skipped and its reason collected, so one typo does
+    // not disable every other configured CA (a whole-config throw would drop all extras and
+    // stop polling their outstanding invoices). Duplicate ticker/asset_id keeps the first and
+    // reports the rest. Callers log Errors and use Assets.
+    public static ExtraAssetsParseResult ParseExtraAssetsResilient(string raw)
+    {
         var list = new List<ZanoAssetDefinition>();
+        var errors = new List<string>();
         if (string.IsNullOrWhiteSpace(raw))
         {
-            return list;
-        }
-
-        var rows = raw.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        foreach (var row in rows)
-        {
-            var parts = row.Split('|', StringSplitOptions.TrimEntries);
-            if (parts.Length < 3)
-            {
-                throw new FormatException(
-                    $"Invalid extra-asset entry '{row}'. Expected TICKER|asset_id|decimals[|DisplayName[|rate_mode[|rate_param]]].");
-            }
-
-            var ticker = parts[0].ToUpperInvariant();
-            var assetId = parts[1].ToLowerInvariant();
-            if (string.IsNullOrEmpty(ticker))
-            {
-                throw new FormatException("Extra-asset ticker is empty.");
-            }
-            if (string.Equals(ticker, ZanoAssets.NativeTicker, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new FormatException($"Extra-asset ticker '{ticker}' collides with native ZANO.");
-            }
-            if (assetId.Length != 64 || !IsLowercaseHex(assetId))
-            {
-                throw new FormatException(
-                    $"Extra-asset '{ticker}' asset_id must be 64 hex chars (got '{parts[1]}').");
-            }
-            if (string.Equals(assetId, ZanoAssets.NativeAssetId, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new FormatException(
-                    $"Extra-asset '{ticker}' uses the native ZANO asset_id; configure it via the built-in native registration instead.");
-            }
-            if (!int.TryParse(parts[2], out var decimals) || decimals < 0 || decimals > 18)
-            {
-                throw new FormatException(
-                    $"Extra-asset '{ticker}' decimals must be an integer in [0, 18] (got '{parts[2]}').");
-            }
-
-            var displayName = parts.Length >= 4 && !string.IsNullOrWhiteSpace(parts[3]) ? parts[3] : ticker;
-            var rateMode = ZanoAssetRateMode.None;
-            string rateParam = null;
-
-            if (parts.Length >= 5 && !string.IsNullOrWhiteSpace(parts[4]))
-            {
-                rateMode = ParseRateMode(ticker, parts[4]);
-            }
-            if (parts.Length >= 6 && !string.IsNullOrWhiteSpace(parts[5]))
-            {
-                rateParam = parts[5];
-            }
-
-            ValidateRateParam(ticker, rateMode, rateParam);
-
-            list.Add(new ZanoAssetDefinition
-            {
-                Ticker = ticker,
-                AssetId = assetId,
-                Decimals = decimals,
-                DisplayName = displayName,
-                RateMode = rateMode,
-                RateParam = rateParam
-            });
+            return new ExtraAssetsParseResult(list, errors);
         }
 
         var seenTickers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var seenAssetIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var a in list)
+        var rows = raw.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var row in rows)
         {
-            if (!seenTickers.Add(a.Ticker))
+            ZanoAssetDefinition asset;
+            try
             {
-                throw new FormatException($"Duplicate extra-asset ticker '{a.Ticker}'.");
+                asset = ParseSingleEntry(row);
             }
-            if (!seenAssetIds.Add(a.AssetId))
+            catch (FormatException ex)
             {
-                throw new FormatException($"Duplicate extra-asset asset_id '{a.AssetId}'.");
+                errors.Add(ex.Message);
+                continue;
             }
+
+            if (!seenTickers.Add(asset.Ticker))
+            {
+                errors.Add($"Duplicate extra-asset ticker '{asset.Ticker}' (kept the first).");
+                continue;
+            }
+            if (!seenAssetIds.Add(asset.AssetId))
+            {
+                errors.Add($"Duplicate extra-asset asset_id '{asset.AssetId}' (kept the first).");
+                continue;
+            }
+            list.Add(asset);
         }
 
-        return list;
+        return new ExtraAssetsParseResult(list, errors);
+    }
+
+    private static ZanoAssetDefinition ParseSingleEntry(string row)
+    {
+        var parts = row.Split('|', StringSplitOptions.TrimEntries);
+        if (parts.Length < 3)
+        {
+            throw new FormatException(
+                $"Invalid extra-asset entry '{row}'. Expected TICKER|asset_id|decimals[|DisplayName[|rate_mode[|rate_param]]].");
+        }
+
+        var ticker = parts[0].ToUpperInvariant();
+        var assetId = parts[1].ToLowerInvariant();
+        if (string.IsNullOrEmpty(ticker))
+        {
+            throw new FormatException("Extra-asset ticker is empty.");
+        }
+        if (string.Equals(ticker, ZanoAssets.NativeTicker, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new FormatException($"Extra-asset ticker '{ticker}' collides with native ZANO.");
+        }
+        if (assetId.Length != 64 || !IsLowercaseHex(assetId))
+        {
+            throw new FormatException(
+                $"Extra-asset '{ticker}' asset_id must be 64 hex chars (got '{parts[1]}').");
+        }
+        if (string.Equals(assetId, ZanoAssets.NativeAssetId, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new FormatException(
+                $"Extra-asset '{ticker}' uses the native ZANO asset_id; configure it via the built-in native registration instead.");
+        }
+        if (!int.TryParse(parts[2], out var decimals) || decimals < 0 || decimals > 18)
+        {
+            throw new FormatException(
+                $"Extra-asset '{ticker}' decimals must be an integer in [0, 18] (got '{parts[2]}').");
+        }
+
+        var displayName = parts.Length >= 4 && !string.IsNullOrWhiteSpace(parts[3]) ? parts[3] : ticker;
+        var rateMode = ZanoAssetRateMode.None;
+        string rateParam = null;
+
+        if (parts.Length >= 5 && !string.IsNullOrWhiteSpace(parts[4]))
+        {
+            rateMode = ParseRateMode(ticker, parts[4]);
+        }
+        if (parts.Length >= 6 && !string.IsNullOrWhiteSpace(parts[5]))
+        {
+            rateParam = parts[5];
+        }
+
+        ValidateRateParam(ticker, rateMode, rateParam);
+
+        return new ZanoAssetDefinition
+        {
+            Ticker = ticker,
+            AssetId = assetId,
+            Decimals = decimals,
+            DisplayName = displayName,
+            RateMode = rateMode,
+            RateParam = rateParam
+        };
     }
 
     private static bool IsLowercaseHex(string s)

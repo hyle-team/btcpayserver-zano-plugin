@@ -180,5 +180,41 @@ namespace BTCPayServer.Plugins.UnitTests.Zano
             Assert.Throws<FormatException>(() =>
                 ZanoAssetDefinition.ParseExtraAssets($"USDZ|{ValidAssetId}|6||{mode}|{param}"));
         }
+
+        // Resilient parse: one bad row must not disable the other configured CAs — the
+        // failure class that took down FUSD QA when a wrong asset_id would have dropped
+        // every extra asset.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ParseExtraAssetsResilient_KeepsValidSkipsInvalid()
+        {
+            var raw = $"USDZ|{ValidAssetId}|6;BADROW|tooshort|6;BTCZ|{OtherAssetId}|8";
+            var result = ZanoAssetDefinition.ParseExtraAssetsResilient(raw);
+            Assert.Equal(2, result.Assets.Count);
+            Assert.Contains(result.Assets, a => a.Ticker == "USDZ");
+            Assert.Contains(result.Assets, a => a.Ticker == "BTCZ");
+            Assert.Single(result.Errors);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ParseExtraAssetsResilient_DuplicateTicker_KeepsFirst()
+        {
+            var raw = $"USDZ|{ValidAssetId}|6;USDZ|{OtherAssetId}|6";
+            var result = ZanoAssetDefinition.ParseExtraAssetsResilient(raw);
+            Assert.Single(result.Assets);
+            Assert.Equal(ValidAssetId, result.Assets[0].AssetId);
+            Assert.Single(result.Errors);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ParseExtraAssetsResilient_AllValid_NoErrors()
+        {
+            var raw = $"USDZ|{ValidAssetId}|6;BTCZ|{OtherAssetId}|8";
+            var result = ZanoAssetDefinition.ParseExtraAssetsResilient(raw);
+            Assert.Equal(2, result.Assets.Count);
+            Assert.Empty(result.Errors);
+        }
     }
 }
