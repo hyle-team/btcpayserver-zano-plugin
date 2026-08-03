@@ -94,6 +94,14 @@ namespace BTCPayServer.Plugins.Zano.Controllers
                 return NotFound();
             }
 
+            // Whitelist gates everything: a CA the merchant hasn't enabled on the
+            // assets page is invisible — its per-method config returns 404 so a
+            // direct URL guess can't reveal or mutate it.
+            if (!IsCryptoWhitelisted(StoreData, cryptoCode))
+            {
+                return NotFound();
+            }
+
             var vm = GetZanoPaymentMethodViewModel(StoreData, cryptoCode,
                 StoreData.GetStoreBlob().GetExcludedPaymentMethods());
             return View("/Views/Zano/GetStoreZanoPaymentMethod.cshtml", vm);
@@ -106,6 +114,11 @@ namespace BTCPayServer.Plugins.Zano.Controllers
             cryptoCode = cryptoCode.ToUpperInvariant();
             if (!_zanoConfiguration.ZanoConfigurationItems.TryGetValue(cryptoCode,
                 out _))
+            {
+                return NotFound();
+            }
+
+            if (!IsCryptoWhitelisted(StoreData, cryptoCode))
             {
                 return NotFound();
             }
@@ -141,6 +154,89 @@ namespace BTCPayServer.Plugins.Zano.Controllers
             storeData.SetStoreBlob(blob);
             await _storeRepository.UpdateStore(storeData);
             return RedirectToAction("GetStoreZanoPaymentMethod", new { cryptoCode });
+        }
+
+        // The whitelist is the SetExcluded blob inverted: a CA is "whitelisted" for a
+        // store iff its payment method is not excluded by the store's blob filter.
+        // We don't keep a separate setting — that would let the two surfaces drift,
+        // and existing stores using CAs successfully would lose them on the next
+        // plugin upgrade until the merchant re-ticked everything. Per-method Enable
+        // toggle and the assets-page checkbox are two surfaces for the same bit.
+        [HttpGet("assets")]
+        public IActionResult StoreZanoAssets()
+        {
+            var vm = BuildAssetsViewModel(StoreData);
+            return View("/Views/Zano/StoreZanoAssets.cshtml", vm);
+        }
+
+        [HttpPost("assets")]
+        public async Task<IActionResult> StoreZanoAssets(StoreZanoAssetsViewModel viewModel)
+        {
+            var registered = _zanoConfiguration.ZanoConfigurationItems.Keys
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var submitted = (viewModel.WhitelistedCryptoCodes ?? [])
+                .Where(c => !string.IsNullOrEmpty(c) && registered.Contains(c))
+                .Select(c => c.ToUpperInvariant())
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var storeData = StoreData;
+            var blob = storeData.GetStoreBlob();
+            var changed = false;
+            foreach (var code in registered)
+            {
+                var pmi = PaymentTypes.CHAIN.GetPaymentMethodId(code);
+                var shouldExclude = !submitted.Contains(code);
+                var currentlyExcluded = blob.GetExcludedPaymentMethods().Match(pmi);
+                if (shouldExclude != currentlyExcluded)
+                {
+                    blob.SetExcluded(pmi, shouldExclude);
+                    changed = true;
+                }
+            }
+            if (changed)
+            {
+                storeData.SetStoreBlob(blob);
+                await _storeRepository.UpdateStore(storeData);
+            }
+
+            TempData["StatusMessage"] = "Zano asset whitelist updated.";
+            return RedirectToAction(nameof(StoreZanoAssets));
+        }
+
+        private StoreZanoAssetsViewModel BuildAssetsViewModel(StoreData storeData)
+        {
+            var excludeFilters = storeData.GetStoreBlob().GetExcludedPaymentMethods();
+            var rows = _zanoConfiguration.ZanoConfigurationItems
+                .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(kv =>
+                {
+                    var pmi = PaymentTypes.CHAIN.GetPaymentMethodId(kv.Key);
+                    return new StoreZanoAssetRow
+                    {
+                        CryptoCode = kv.Key,
+                        Enabled = !excludeFilters.Match(pmi)
+                    };
+                })
+                .ToList();
+            return new StoreZanoAssetsViewModel { Rows = rows };
+        }
+
+        private bool IsCryptoWhitelisted(StoreData storeData, string cryptoCode)
+        {
+            var pmi = PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode);
+            return !storeData.GetStoreBlob().GetExcludedPaymentMethods().Match(pmi);
+        }
+
+        public class StoreZanoAssetsViewModel
+        {
+            public List<StoreZanoAssetRow> Rows { get; set; } = [];
+            public List<string> WhitelistedCryptoCodes { get; set; } = [];
+        }
+
+        public class StoreZanoAssetRow
+        {
+            public string CryptoCode { get; set; }
+            public bool Enabled { get; set; }
         }
 
         public class ZanoPaymentMethodViewModel : IValidatableObject

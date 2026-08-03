@@ -415,13 +415,6 @@ namespace BTCPayServer.Plugins.Zano.Services
                 }
             }
 
-            if (candidates.Count == 0)
-            {
-                // No match for any monitored payment_id of this crypto. Never bump
-                // confirmations from stale local data without wallet evidence.
-                return;
-            }
-
             var updatedPaymentEntities = new List<(PaymentEntity Payment, InvoiceEntity invoice)>();
             var processingTasks = new List<Task>();
 
@@ -467,6 +460,51 @@ namespace BTCPayServer.Plugins.Zano.Services
 
             await Task.WhenAll(processingTasks);
 
+            // Drop-detection: any existing payment whose (tx, pid, asset) did NOT
+            // appear in the wallet scan is a candidate for being dropped — deep reorg,
+            // wallet prune, history past our paging cap. We increment a per-payment
+            // counter and after DropDetectionThreshold consecutive missing polls
+            // (~75s at the default 15s poll interval) flip an already-Settled invoice
+            // back to Processing so the merchant sees the wallet evidence is gone.
+            //
+            // The wallet-empty case (allTransfers.Count == 0) is filtered upstream so
+            // a wallet outage doesn't increment counters. A payment that re-appears
+            // (e.g. wallet rescan) is matched by HandlePaymentData, which rewrites
+            // Details from scratch and resets MissingPollCount to its 0 default.
+            var matchedKeys = new HashSet<string>(
+                dedupedCandidates.Select(c => DropDetectionKey(c.TxHash, c.PaymentId, c.AssetId)),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var invoiceCtx in ctx.ExpandedInvoices)
+            {
+                foreach (var existing in invoiceCtx.ExistingPayments)
+                {
+                    var existingDetails = ctx.Handler.ParsePaymentDetails(existing.Details);
+                    if (existingDetails == null)
+                    {
+                        continue;
+                    }
+                    var key = DropDetectionKey(existingDetails.TransactionId, existingDetails.PaymentId, existingDetails.AssetId);
+                    if (matchedKeys.Contains(key))
+                    {
+                        continue;
+                    }
+
+                    existingDetails.MissingPollCount++;
+                    var shouldFlip = existingDetails.MissingPollCount >= DropDetectionThreshold
+                                     && existing.Status == PaymentStatus.Settled;
+                    if (shouldFlip)
+                    {
+                        existing.Status = PaymentStatus.Processing;
+                        _logger.LogWarning(
+                            "Zano drop-detection: flipping Settled→Processing for invoice {InvoiceId} pid={Pid} tx={Tx} after {Threshold} missing polls",
+                            invoiceCtx.Invoice.Id, existingDetails.PaymentId, existingDetails.TransactionId, DropDetectionThreshold);
+                    }
+                    existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
+                    updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
+                }
+            }
+
             if (updatedPaymentEntities.Any())
             {
                 await _paymentService.UpdatePayments(updatedPaymentEntities.Select(t => t.Payment).ToList());
@@ -476,6 +514,13 @@ namespace BTCPayServer.Plugins.Zano.Services
                 }
             }
         }
+
+        // Five missed polls (~75s at the default 15s poll interval) before we
+        // consider a Settled invoice's tx as truly dropped from the wallet.
+        private const int DropDetectionThreshold = 5;
+
+        private static string DropDetectionKey(string txHash, string paymentId, string assetId) =>
+            $"{txHash}#{paymentId}#{assetId}";
 
         // UpdateExistingPaymentConfirmations was removed: it bumped confirmations from
         // stored BlockHeight + daemon currentHeight whenever the wallet returned no
