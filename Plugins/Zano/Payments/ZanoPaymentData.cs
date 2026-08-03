@@ -10,11 +10,11 @@ namespace BTCPayServer.Plugins.Zano.Payments
         public long LockTime { get; set; } = 0;
         public string AssetId { get; set; }
 
-        // Count of consecutive wallet scans where the wallet was reachable, had
-        // transfers, but did not include this payment's (txHash, paymentId, assetId).
-        // Reset to 0 whenever the payment is re-matched. Used to flip an already-
-        // Settled invoice back to Processing after the wallet has clearly dropped
-        // the tx (deep reorg, wallet prune) rather than just having missed it once.
+        // Count of consecutive reconciliation passes where the wallet history omitted
+        // this payment and the daemon's targeted get_tx_details lookup confirmed that
+        // the transaction is absent from both chain and mempool. Reset when either
+        // source sees the transaction again. At the threshold the payment becomes
+        // Unaccounted and a terminal settled invoice is reopened for recalculation.
         public int MissingPollCount { get; set; } = 0;
     }
 }
