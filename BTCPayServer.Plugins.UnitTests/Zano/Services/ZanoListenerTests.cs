@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 
 using BTCPayServer.Client.Models;
+using BTCPayServer.Data;
 using BTCPayServer.Plugins.Zano.Payments;
 using BTCPayServer.Plugins.Zano.RPC.Models;
 using BTCPayServer.Plugins.Zano.Services;
@@ -321,6 +322,35 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 13975, LockTime = 13985 }));       // confirmed
             Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 0, LockTime = 0 }));               // no lock
             Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 0, LockTime = 1_700_000_000L }));  // timestamp form
+        }
+
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData(PaymentStatus.Processing, 4, false)]
+        [InlineData(PaymentStatus.Settled, 4, false)]
+        [InlineData(PaymentStatus.Processing, 5, true)]
+        [InlineData(PaymentStatus.Settled, 5, true)]
+        [InlineData(PaymentStatus.Unaccounted, 5, false)]
+        public void ShouldUnaccountMissingPayment_RequiresThresholdAndAccountedStatus(
+            PaymentStatus status,
+            int missingPollCount,
+            bool expected)
+        {
+            Assert.Equal(expected, ZanoListener.ShouldUnaccountMissingPayment(status, missingPollCount));
+        }
+
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData(InvoiceStatus.Settled, InvoiceExceptionStatus.None, true)]
+        [InlineData(InvoiceStatus.Settled, InvoiceExceptionStatus.PaidOver, true)]
+        [InlineData(InvoiceStatus.Settled, InvoiceExceptionStatus.Marked, false)]
+        [InlineData(InvoiceStatus.Processing, InvoiceExceptionStatus.None, false)]
+        public void ShouldReopenSettledInvoice_PreservesManualCompletion(
+            InvoiceStatus status,
+            InvoiceExceptionStatus exceptionStatus,
+            bool expected)
+        {
+            Assert.Equal(expected, ZanoListener.ShouldReopenSettledInvoice(status, exceptionStatus));
         }
     }
 }

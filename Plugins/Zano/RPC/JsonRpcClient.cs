@@ -55,6 +55,7 @@ namespace BTCPayServer.Plugins.Zano.RPC
             "getinfo",
             "get_wallet_info",
             "get_recent_txs_and_info2",
+            "get_tx_details",
             "get_asset_info",
             "make_integrated_address",
             "open_wallet"

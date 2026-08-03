@@ -19,6 +19,7 @@ using BTCPayServer.Services;
 using BTCPayServer.Services.Invoices;
 
 using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 
 using Newtonsoft.Json.Linq;
 
@@ -167,7 +168,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                         continue;
                     }
                     var paymentMethodId = PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode);
-                    var invoices = await _invoiceRepository.GetMonitoredInvoices(paymentMethodId);
+                    var invoices = await GetReconciliationInvoices(paymentMethodId, cancellationToken);
                     if (!invoices.Any())
                     {
                         continue;
@@ -199,19 +200,12 @@ namespace BTCPayServer.Plugins.Zano.Services
                     return;
                 }
 
-                var (allTransfers, scanComplete) = await FetchWalletTransfersAsync(
+                var (allTransfers, _) = await FetchWalletTransfersAsync(
                     walletRpcClient, walletClientCryptoCode, allPaymentIds, cancellationToken);
-                if (allTransfers.Count == 0)
-                {
-                    // Wallet returned no transfers at all — don't bump confs from stale
-                    // local data. The next poll will retry; if a recorded payment really
-                    // did go away, its status simply won't change here.
-                    return;
-                }
 
                 foreach (var ctx in perCrypto)
                 {
-                    await ProcessTransfersForCryptoAsync(ctx, allTransfers, scanComplete);
+                    await ProcessTransfersForCryptoAsync(ctx, allTransfers, cancellationToken);
                 }
             }
             finally
@@ -400,7 +394,7 @@ namespace BTCPayServer.Plugins.Zano.Services
         private async Task ProcessTransfersForCryptoAsync(
             CryptoScanContext ctx,
             List<ZanoTransfer> allTransfers,
-            bool scanComplete)
+            CancellationToken cancellationToken)
         {
             long currentHeight = 0;
             if (_zanoRpcProvider.Summaries.TryGetValue(ctx.CryptoCode, out var summary))
@@ -495,61 +489,72 @@ namespace BTCPayServer.Plugins.Zano.Services
 
             await Task.WhenAll(processingTasks);
 
-            // Drop-detection: any existing payment whose (tx, pid, asset) did NOT
-            // appear in the wallet scan is a candidate for being dropped — deep reorg,
-            // wallet prune, history past our paging cap. We increment a per-payment
-            // counter and after DropDetectionThreshold consecutive missing polls
-            // (~75s at the default 15s poll interval) flip an already-Settled invoice
-            // back to Processing so the merchant sees the wallet evidence is gone.
-            //
-            // GATED ON scanComplete: on a capped/failed/cancelled scan, "absent" only means
-            // "we didn't look far enough", not "dropped". Counting those as misses would
-            // down-count a valid but aged-out payment. We only treat absence as evidence
-            // when the scan located every monitored payment id or exhausted the history.
-            // The wallet-empty case (allTransfers.Count == 0) is filtered upstream so
-            // a wallet outage doesn't increment counters. A payment that re-appears
-            // (e.g. wallet rescan) is matched by HandlePaymentData, which rewrites
-            // Details from scratch and resets MissingPollCount to its 0 default.
-            if (scanComplete)
+            // A history-window miss is never enough to invalidate a payment. Confirm the
+            // exact transaction against the daemon before changing accounting state. This
+            // remains safe when the wallet scan is capped, pruned, or simply too busy to
+            // include an older payment. A daemon lookup that fails for any reason other
+            // than "not found" is inconclusive and leaves the payment untouched.
+            var matchedKeys = new HashSet<string>(
+                dedupedCandidates.Select(c => DropDetectionKey(c.TxHash, c.PaymentId, c.AssetId)),
+                StringComparer.OrdinalIgnoreCase);
+            var invoicesToReopen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var invoiceCtx in ctx.ExpandedInvoices)
             {
-                var matchedKeys = new HashSet<string>(
-                    dedupedCandidates.Select(c => DropDetectionKey(c.TxHash, c.PaymentId, c.AssetId)),
-                    StringComparer.OrdinalIgnoreCase);
-
-                foreach (var invoiceCtx in ctx.ExpandedInvoices)
+                foreach (var existing in invoiceCtx.ExistingPayments)
                 {
-                    foreach (var existing in invoiceCtx.ExistingPayments)
+                    var existingDetails = ctx.Handler.ParsePaymentDetails(existing.Details);
+                    if (existingDetails == null)
                     {
-                        var existingDetails = ctx.Handler.ParsePaymentDetails(existing.Details);
-                        if (existingDetails == null)
-                        {
-                            continue;
-                        }
-                        var key = DropDetectionKey(existingDetails.TransactionId, existingDetails.PaymentId, existingDetails.AssetId);
-                        if (matchedKeys.Contains(key))
-                        {
-                            continue;
-                        }
-
-                        existingDetails.MissingPollCount++;
-                        var shouldFlip = existingDetails.MissingPollCount >= DropDetectionThreshold
-                                         && existing.Status == PaymentStatus.Settled;
-                        if (shouldFlip)
-                        {
-                            existing.Status = PaymentStatus.Processing;
-                            _logger.LogWarning(
-                                "Zano drop-detection: flipping Settled→Processing for invoice {InvoiceId} pid={Pid} tx={Tx} after {Threshold} missing polls",
-                                invoiceCtx.Invoice.Id, existingDetails.PaymentId, existingDetails.TransactionId, DropDetectionThreshold);
-                        }
-                        existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
-                        updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
+                        continue;
                     }
+                    var key = DropDetectionKey(existingDetails.TransactionId, existingDetails.PaymentId, existingDetails.AssetId);
+                    if (matchedKeys.Contains(key))
+                    {
+                        continue;
+                    }
+
+                    var txExists = await TransactionExistsAsync(
+                        ctx.CryptoCode, existingDetails.TransactionId, cancellationToken);
+                    if (txExists is not false)
+                    {
+                        if (txExists is true && existingDetails.MissingPollCount != 0)
+                        {
+                            existingDetails.MissingPollCount = 0;
+                            existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
+                            updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
+                        }
+                        continue;
+                    }
+
+                    existingDetails.MissingPollCount++;
+                    if (ShouldUnaccountMissingPayment(existing.Status, existingDetails.MissingPollCount))
+                    {
+                        existing.Status = PaymentStatus.Unaccounted;
+                        existingDetails.ConfirmationCount = 0;
+                        if (ShouldReopenSettledInvoice(invoiceCtx.Invoice.Status, invoiceCtx.Invoice.ExceptionStatus))
+                        {
+                            invoicesToReopen.Add(invoiceCtx.Invoice.Id);
+                        }
+                        _logger.LogWarning(
+                            "Zano reconciliation: transaction missing from daemon; invoice={InvoiceId} pid={Pid} tx={Tx} marked unaccounted after {Threshold} checks",
+                            invoiceCtx.Invoice.Id, existingDetails.PaymentId, existingDetails.TransactionId, DropDetectionThreshold);
+                    }
+                    existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
+                    updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
                 }
             }
 
             if (updatedPaymentEntities.Any())
             {
                 await _paymentService.UpdatePayments(updatedPaymentEntities.Select(t => t.Payment).ToList());
+                foreach (var invoiceId in invoicesToReopen)
+                {
+                    var invoice = updatedPaymentEntities.First(t => t.invoice.Id == invoiceId).invoice;
+                    await _invoiceRepository.UpdateInvoiceStatus(
+                        invoiceId,
+                        new InvoiceState(InvoiceStatus.Processing, invoice.ExceptionStatus));
+                }
                 foreach (var group in updatedPaymentEntities.GroupBy(e => e.invoice))
                 {
                     _eventAggregator.Publish(new InvoiceNeedUpdateEvent(group.Key.Id));
@@ -560,6 +565,93 @@ namespace BTCPayServer.Plugins.Zano.Services
         // Five missed polls (~75s at the default 15s poll interval) before we
         // consider a Settled invoice's tx as truly dropped from the wallet.
         private const int DropDetectionThreshold = 5;
+
+        // A settled invoice is terminal in BTCPay and drops out of
+        // GetMonitoredInvoices. Keep recently received settled Zano payments in the
+        // reconciliation set long enough to catch ordinary chain reorganizations,
+        // without polling the complete invoice history forever.
+        private static readonly TimeSpan SettledReconciliationWindow = TimeSpan.FromHours(24);
+
+        private const int TxNotFoundRpcErrorCode = -14;
+
+        private async Task<InvoiceEntity[]> GetReconciliationInvoices(
+            PaymentMethodId paymentMethodId,
+            CancellationToken cancellationToken)
+        {
+            var monitored = await _invoiceRepository.GetMonitoredInvoices(paymentMethodId, cancellationToken);
+            var cutoff = DateTimeOffset.UtcNow.Subtract(SettledReconciliationWindow);
+            string paymentMethod = paymentMethodId.ToString();
+            string settled = InvoiceStatus.Settled.ToString();
+
+            using var db = _invoiceRepository.DbContextFactory.CreateContext();
+            var recentlySettledIds = await db.Payments
+                .Where(p => p.PaymentMethodId == paymentMethod
+                            && p.Status == PaymentStatus.Settled
+                            && p.Created.HasValue
+                            && p.Created.Value >= cutoff
+                            && p.InvoiceData.Status == settled)
+                .Select(p => p.InvoiceDataId)
+                .Distinct()
+                .ToArrayAsync(cancellationToken);
+
+            if (recentlySettledIds.Length == 0)
+            {
+                return monitored;
+            }
+
+            var recentlySettled = await _invoiceRepository.GetInvoices(recentlySettledIds);
+            return monitored
+                .Concat(recentlySettled)
+                .GroupBy(invoice => invoice.Id, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToArray();
+        }
+
+        private async Task<bool?> TransactionExistsAsync(
+            string cryptoCode,
+            string transactionId,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(transactionId)
+                || !_zanoRpcProvider.DaemonRpcClients.TryGetValue(cryptoCode, out var daemonRpcClient))
+            {
+                return null;
+            }
+
+            try
+            {
+                var response = await daemonRpcClient.SendCommandAsync<GetTxDetailsRequest, GetTxDetailsResponse>(
+                    "get_tx_details",
+                    new GetTxDetailsRequest { TxHash = transactionId },
+                    cancellationToken);
+                return string.Equals(response?.Status, "OK", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (JsonRpcClient.JsonRpcApiException ex) when (ex.Error?.Code == TxNotFoundRpcErrorCode)
+            {
+                return false;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Zano reconciliation could not verify transaction {Tx} via {CryptoCode} daemon",
+                    transactionId, cryptoCode);
+                return null;
+            }
+        }
+
+        public static bool ShouldUnaccountMissingPayment(PaymentStatus status, int missingPollCount)
+            => missingPollCount >= DropDetectionThreshold
+               && status is PaymentStatus.Processing or PaymentStatus.Settled;
+
+        public static bool ShouldReopenSettledInvoice(
+            InvoiceStatus status,
+            InvoiceExceptionStatus exceptionStatus)
+            => status == InvoiceStatus.Settled
+               && exceptionStatus != InvoiceExceptionStatus.Marked;
 
         private static string DropDetectionKey(string txHash, string paymentId, string assetId) =>
             $"{txHash}#{paymentId}#{assetId}";
