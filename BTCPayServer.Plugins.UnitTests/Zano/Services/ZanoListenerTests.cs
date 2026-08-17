@@ -1,5 +1,11 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
 using BTCPayServer.Client.Models;
+using BTCPayServer.Data;
 using BTCPayServer.Plugins.Zano.Payments;
+using BTCPayServer.Plugins.Zano.RPC.Models;
 using BTCPayServer.Plugins.Zano.Services;
 
 using Xunit;
@@ -250,6 +256,399 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             var result = ZanoListener.AggregateCandidates(input);
             Assert.Single(result);
             Assert.Equal(10_000_000_000_000_000_000m, result[0].Amount);
+        }
+
+        // Page-overlap guard: the same confirmed tx returned on two adjacent pages (growing
+        // history shifts the newest-first window) must collapse to ONE row, so
+        // AggregateCandidates does not sum the duplicate and double-credit the payment.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void DedupTransferRows_CollapsesDuplicateTxRows()
+        {
+            static ZanoTransfer Row() => new()
+            {
+                TxHash = "tx1",
+                Height = 13975,
+                SubtransfersByPid = new List<ZanoPaymentIdGroup>
+                {
+                    new() { PaymentId = "pid1", Subtransfers = new List<ZanoSubtransfer> { new() { Amount = 100m, AssetId = "a", IsIncome = true } } }
+                }
+            };
+            var result = ZanoListener.DedupTransferRows(new[] { Row(), Row() });
+            Assert.Single(result);
+            Assert.Equal("tx1", result[0].TxHash);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void DedupTransferRows_KeepsConfirmedOverMempoolForSameTx()
+        {
+            static ZanoTransfer Row(long h) => new() { TxHash = "tx1", Height = h, SubtransfersByPid = new List<ZanoPaymentIdGroup>() };
+            var result = ZanoListener.DedupTransferRows(new[] { Row(0), Row(13975) });
+            Assert.Single(result);
+            Assert.Equal(13975L, result[0].Height);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void DedupTransferRows_KeepsDistinctTxs()
+        {
+            static ZanoTransfer Row(string h) => new() { TxHash = h, Height = 1, SubtransfersByPid = new List<ZanoPaymentIdGroup>() };
+            var result = ZanoListener.DedupTransferRows(new[] { Row("tx1"), Row("tx2") });
+            Assert.Equal(2, result.Count);
+        }
+
+        // A mempool (BlockHeight==0) transfer carrying a future height-form unlock_time must
+        // NOT settle even under HighSpeed/0-conf: the output is locked until a future block,
+        // and ConfirmationsRequired can't express that while unconfirmed.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void GetStatus_HeightLockedMempool_StaysProcessing()
+        {
+            var details = new ZanoPaymentData
+            {
+                BlockHeight = 0,
+                ConfirmationCount = 0,
+                LockTime = 13985,
+                InvoiceSettledConfirmationThreshold = 0
+            };
+            Assert.True(ZanoListener.IsHeightLockedUnconfirmed(details));
+            Assert.False(ZanoListener.GetStatus(details, SpeedPolicy.HighSpeed, nowUnixSeconds: 1_700_000_000L));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsHeightLockedUnconfirmed_ConfirmedOrTimestampOrNoLock_IsFalse()
+        {
+            Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 13975, LockTime = 13985 }));       // confirmed
+            Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 0, LockTime = 0 }));               // no lock
+            Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 0, LockTime = 1_700_000_000L }));  // timestamp form
+        }
+
+        // Only SETTLED payments may be unaccounted by drop-detection. Unaccounting a
+        // Processing (unconfirmed) payment on mempool churn reverts a still-payable
+        // invoice to New and invites a double payment while the original tx can still
+        // confirm — the old (Processing or Settled) scope was a regression vector.
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData(PaymentStatus.Settled, 4, false)]
+        [InlineData(PaymentStatus.Settled, 5, true)]
+        [InlineData(PaymentStatus.Settled, 6, true)]
+        [InlineData(PaymentStatus.Processing, 5, false)]
+        [InlineData(PaymentStatus.Unaccounted, 5, false)]
+        public void ShouldUnaccountMissingPayment_RequiresThresholdAndSettledStatus(
+            PaymentStatus status,
+            int missingPollCount,
+            bool expected)
+        {
+            Assert.Equal(expected, ZanoListener.ShouldUnaccountMissingPayment(status, missingPollCount));
+        }
+
+        // Tri-state contract for get_tx_details replies: only a structurally valid OK
+        // response (status OK + tx_info) proves existence; everything else that the
+        // daemon can answer with HTTP 200 is INCONCLUSIVE (null), never "absent".
+        // ("Absent" is exclusively the -14 error, handled by the caller's exception
+        // filter.) Regression guard: the old mapping returned false for null results
+        // and non-OK statuses, letting ~75s of degraded proxy replies unaccount a
+        // settled payment.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_ValidOkWithTxInfo_IsTrue()
+        {
+            var response = new GetTxDetailsResponse { Status = "OK", TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
+            Assert.True(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_OkStatusIsCaseInsensitive()
+        {
+            var response = new GetTxDetailsResponse { Status = "ok", TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
+            Assert.True(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_NullResponse_IsInconclusive()
+        {
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(null));
+        }
+
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData("")]
+        [InlineData("BUSY")]
+        [InlineData("CORE_BUSY")]
+        [InlineData("INTERNAL_ERROR")]
+        public void ClassifyTxDetailsResponse_NonOkStatus_IsInconclusive(string status)
+        {
+            var response = new GetTxDetailsResponse { Status = status, TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_MissingStatus_IsInconclusive()
+        {
+            var response = new GetTxDetailsResponse { Status = null, TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_OkWithoutTxInfo_IsInconclusive()
+        {
+            var response = new GetTxDetailsResponse { Status = "OK", TxInfo = null };
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        // Recovery must never trust the pre-drop record. keeper_block > 0 = confirmed
+        // at that height; -1 = pool only → zero confirmations, Processing at most.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ApplyRecoveredPlacement_ConfirmedTx_RecomputesFromKeeperBlock()
+        {
+            var details = new ZanoPaymentData { BlockHeight = 100, ConfirmationCount = 50 };
+            ZanoListener.ApplyRecoveredPlacement(details, keeperBlock: 120, currentHeight: 123);
+            Assert.Equal(120L, details.BlockHeight);
+            Assert.Equal(3L, details.ConfirmationCount);
+        }
+
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData(-1L)]
+        [InlineData(0L)]
+        [InlineData(null)]
+        public void ApplyRecoveredPlacement_PoolOrUnknown_ZeroesConfirmations(long? keeperBlock)
+        {
+            var details = new ZanoPaymentData { BlockHeight = 100, ConfirmationCount = 50 };
+            ZanoListener.ApplyRecoveredPlacement(details, keeperBlock, currentHeight: 123);
+            Assert.Equal(0L, details.BlockHeight);
+            Assert.Equal(0L, details.ConfirmationCount);
+            Assert.False(ZanoListener.GetStatus(details, SpeedPolicy.MediumSpeed, nowUnixSeconds: 1_700_000_000L));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ApplyRecoveredPlacement_ReorgBelowTip_ClampsToZero()
+        {
+            var details = new ZanoPaymentData();
+            ZanoListener.ApplyRecoveredPlacement(details, keeperBlock: 130, currentHeight: 123);
+            Assert.Equal(0L, details.ConfirmationCount);
+        }
+
+        // Window is anchored on first settlement when known; Created is only a fallback
+        // for rows written before SettledAt existed.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsWithinReconciliationWindow_UsesSettledAtOverCreated()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var createdLongAgo = now.AddDays(-10);
+            var settledRecently = now.AddHours(-1).ToUnixTimeSeconds();
+            Assert.True(ZanoListener.IsWithinReconciliationWindow(settledRecently, createdLongAgo, now));
+            Assert.False(ZanoListener.IsWithinReconciliationWindow(null, createdLongAgo, now));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsWithinReconciliationWindow_SettledAtPastWindow_IsFalse()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var settledOld = now.AddHours(-49).ToUnixTimeSeconds();
+            Assert.False(ZanoListener.IsWithinReconciliationWindow(settledOld, now.AddMinutes(-5), now));
+        }
+
+        // Cached daemon positives are bypassed in the last (TTL + threshold polls) of
+        // the window so a drop there can still accumulate conclusive misses.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsInReconciliationTail_TrueNearWindowEnd_FalseEarly()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var early = new ZanoPaymentData { SettledAt = now.AddHours(-1).ToUnixTimeSeconds() };
+            var late = new ZanoPaymentData { SettledAt = now.AddHours(-48).AddMinutes(3).ToUnixTimeSeconds() };
+            var past = new ZanoPaymentData { SettledAt = now.AddHours(-50).ToUnixTimeSeconds() };
+            Assert.False(ZanoListener.IsInReconciliationTail(early, now, now));
+            Assert.True(ZanoListener.IsInReconciliationTail(late, now, now));
+            Assert.True(ZanoListener.IsInReconciliationTail(past, now, now));
+        }
+
+        // get_bulk_payments tri-state: null result = inconclusive; a result object with
+        // no payments key = genuinely empty (epee omits empty containers) = conclusive
+        // "not listed"; otherwise the exact tx hash must be present.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyBulkPaymentsResponse_NullResult_IsInconclusive()
+        {
+            Assert.Null(ZanoListener.ClassifyBulkPaymentsResponse(null, "tx1"));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyBulkPaymentsResponse_MissingPaymentsKey_IsNotListed()
+        {
+            Assert.False(ZanoListener.ClassifyBulkPaymentsResponse(new GetBulkPaymentsResponse { Payments = null }, "tx1"));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyBulkPaymentsResponse_MatchesTxHashCaseInsensitively()
+        {
+            var r = new GetBulkPaymentsResponse
+            {
+                Payments = new List<Payment> { new() { TxHash = "ABC123", PaymentId = "pid1", BlockHeight = 0 } }
+            };
+            Assert.True(ZanoListener.ClassifyBulkPaymentsResponse(r, "abc123"));
+            Assert.False(ZanoListener.ClassifyBulkPaymentsResponse(r, "other"));
+        }
+
+        // Selection is decided from durable per-payment state, never from memory:
+        // settlement window, in-flight miss sequence, unaccounted-within-recovery, or an
+        // undelivered loss alert.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NeedsReconciliation_InFlightMissSequence_StaysEligiblePastWindow()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData { SettledAt = now.AddDays(-5).ToUnixTimeSeconds(), MissingPollCount = 3 };
+            Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Settled, d, now.AddDays(-6), now));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NeedsReconciliation_UnaccountedInsideRecoveryWindow_IsEligible()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData
+            {
+                SettledAt = now.AddDays(-10).ToUnixTimeSeconds(),
+                UnaccountedAt = now.AddDays(-2).ToUnixTimeSeconds(),
+                LossEpisode = 1
+            };
+            Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-11), now));
+            d.UnaccountedAt = now.AddDays(-8).ToUnixTimeSeconds();
+            Assert.False(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-11), now));
+        }
+
+        // Any undelivered merchant alert keeps the payment eligible regardless of its
+        // current status or age — the alert outbox must drain even after the payment
+        // was restored by the wallet or aged out of every window.
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData(PaymentStatus.Unaccounted)]
+        [InlineData(PaymentStatus.Settled)]
+        [InlineData(PaymentStatus.Processing)]
+        public void NeedsReconciliation_PendingAlert_IsEligibleRegardlessOfStatusOrAge(PaymentStatus status)
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData
+            {
+                SettledAt = now.AddDays(-20).ToUnixTimeSeconds(),
+                UnaccountedAt = now.AddDays(-15).ToUnixTimeSeconds(),
+                LossEpisode = 1
+            };
+            ZanoListener.QueueAlert(d, ZanoPaymentReconciliationNotification.Kind.PaymentLost, PaymentStatus.Unaccounted, now);
+            Assert.True(d.HasPendingAlert);
+            Assert.True(ZanoListener.NeedsReconciliation(status, d, now.AddDays(-21), now));
+        }
+
+        // Alert records are immutable snapshots: a delayed delivery reports the
+        // placement/status at the transition, and repeated episodes stack rather than
+        // overwrite each other.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void QueueAlert_StacksEpisodesWithSnapshots()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData { BlockHeight = 100, ConfirmationCount = 7 };
+            d.LossEpisode = 1;
+            ZanoListener.QueueAlert(d, ZanoPaymentReconciliationNotification.Kind.PaymentLost, PaymentStatus.Unaccounted, now);
+            d.BlockHeight = 0; d.ConfirmationCount = 0;
+            ZanoListener.QueueAlert(d, ZanoPaymentReconciliationNotification.Kind.PaymentRestored, PaymentStatus.Processing, now);
+            d.LossEpisode = 2;
+            ZanoListener.QueueAlert(d, ZanoPaymentReconciliationNotification.Kind.PaymentLost, PaymentStatus.Unaccounted, now);
+            Assert.Equal(3, d.PendingAlerts.Count);
+            Assert.Equal("L1", d.PendingAlerts[0].Episode);
+            Assert.Equal(100L, d.PendingAlerts[0].BlockHeight);
+            Assert.Equal("PaymentRestored", d.PendingAlerts[1].Kind);
+            Assert.Equal("Processing", d.PendingAlerts[1].Status);
+            Assert.Equal("L2", d.PendingAlerts[2].Episode);
+        }
+
+        // The outbox bound must never lose an alert silently: every evicted record is
+        // returned to the caller (which logs it with invoice/payment identity), and
+        // nothing is evicted until the bound is actually exceeded.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void QueueAlert_IsBounded_AndReportsEveryEvictedRecord()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData();
+            var evictedAll = new List<ZanoPendingAlert>();
+            for (var i = 1; i <= 40; i++)
+            {
+                d.RegressionEpisode = i;
+                var evicted = ZanoListener.QueueAlert(d, ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed, PaymentStatus.Processing, now);
+                if (i <= 32)
+                {
+                    Assert.Empty(evicted);
+                }
+                else
+                {
+                    Assert.Single(evicted);
+                    Assert.Equal($"G{i - 32}", evicted[0].Episode);
+                }
+                evictedAll.AddRange(evicted);
+            }
+            Assert.Equal(32, d.PendingAlerts.Count);
+            Assert.Equal("G9", d.PendingAlerts[0].Episode);
+            Assert.Equal("G40", d.PendingAlerts[^1].Episode);
+            Assert.Equal(8, evictedAll.Count);
+            Assert.Equal(new[] { "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8" }, evictedAll.Select(e => e.Episode).ToArray());
+        }
+
+        // Fair progress: the next pass starts right after the last row a probe was
+        // issued for, wraps at the end, and tolerates the resume key vanishing.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NextWorkIndex_ResumesAfterLastAttempted()
+        {
+            var keys = new List<string> { "a", "c", "e", "g" };
+            Assert.Equal(0, ZanoListener.NextWorkIndex(keys, null));
+            Assert.Equal(1, ZanoListener.NextWorkIndex(keys, "a"));
+            Assert.Equal(2, ZanoListener.NextWorkIndex(keys, "d")); // vanished key: next greater
+            Assert.Equal(0, ZanoListener.NextWorkIndex(keys, "g")); // wrap
+            Assert.Equal(0, ZanoListener.NextWorkIndex(new List<string>(), "a"));
+        }
+
+        // The durable selection marker tracks the row's actual obligations.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void RefreshReconciliationActive_TracksNeedsReconciliation()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var fresh = new ZanoPaymentData { SettledAt = now.AddHours(-1).ToUnixTimeSeconds() };
+            ZanoListener.RefreshReconciliationActive(fresh, PaymentStatus.Settled, now.AddDays(-40), now);
+            Assert.True(fresh.ReconciliationActive);
+            var lapsed = new ZanoPaymentData { SettledAt = now.AddDays(-5).ToUnixTimeSeconds() };
+            ZanoListener.RefreshReconciliationActive(lapsed, PaymentStatus.Settled, now.AddDays(-6), now);
+            Assert.False(lapsed.ReconciliationActive);
+        }
+
+        // The JSONB containment predicate used by selection must match what the blob
+        // serializer actually writes: camelCase, defaults omitted, nested under
+        // PaymentBlob.details. Guard against a silent rename breaking selection.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ReconciliationActiveMarker_SerializesAsExpectedByTheContainmentPredicate()
+        {
+            var serializer = BTCPayServer.Data.BlobSerializer.CreateSerializer().Serializer;
+            var active = Newtonsoft.Json.Linq.JToken.FromObject(new ZanoPaymentData { ReconciliationActive = true }, serializer);
+            var inactive = Newtonsoft.Json.Linq.JToken.FromObject(new ZanoPaymentData { ReconciliationActive = false }, serializer);
+            Assert.True((bool)active["reconciliationActive"]);
+            Assert.Null(inactive["reconciliationActive"]);
+            Assert.Null(active["hasPendingAlert"]);
         }
     }
 }

@@ -4,25 +4,28 @@ using Xunit;
 
 namespace BTCPayServer.Plugins.UnitTests.Zano.RPC
 {
-    public class ZanoPollEventTest
+    public class ZanoWalletPollEventTest
     {
         [Fact]
-        public void DefaultInitialization_ShouldHaveNullCryptoCode()
+        public void DefaultInitialization_ShouldHaveNullFields()
         {
-            var pollEvent = new ZanoPollEvent();
+            var pollEvent = new ZanoWalletPollEvent();
 
-            Assert.Null(pollEvent.CryptoCode);
+            Assert.Null(pollEvent.WalletKey);
+            Assert.Null(pollEvent.CryptoCodes);
         }
 
         [Fact]
         public void PropertyAssignment_ShouldSetAndRetrieveValues()
         {
-            var pollEvent = new ZanoPollEvent
+            var pollEvent = new ZanoWalletPollEvent
             {
-                CryptoCode = "ZANO"
+                WalletKey = "http://wallet:12233/",
+                CryptoCodes = new[] { "ZANO", "ZANOTEST" }
             };
 
-            Assert.Equal("ZANO", pollEvent.CryptoCode);
+            Assert.Equal("http://wallet:12233/", pollEvent.WalletKey);
+            Assert.Equal(new[] { "ZANO", "ZANOTEST" }, pollEvent.CryptoCodes);
         }
     }
 }

@@ -55,6 +55,60 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Configuration
 
         [Trait("Category", "Unit")]
         [Fact]
+        public void GroupByWallet_GroupsCryptosSharingAWalletUri()
+        {
+            var sharedWallet = new Uri("http://localhost:11212/");
+            var config = new ZanoConfiguration();
+            config.ZanoConfigurationItems.Add("ZANO", new ZanoConfigurationItem
+            {
+                DaemonRpcUri = new Uri("http://localhost:11211"),
+                InternalWalletRpcUri = sharedWallet
+            });
+            config.ZanoConfigurationItems.Add("ZANOTEST", new ZanoConfigurationItem
+            {
+                DaemonRpcUri = new Uri("http://localhost:11211"),
+                InternalWalletRpcUri = sharedWallet
+            });
+            config.ZanoConfigurationItems.Add("ZANOALT", new ZanoConfigurationItem
+            {
+                DaemonRpcUri = new Uri("http://localhost:11221"),
+                InternalWalletRpcUri = new Uri("http://localhost:11222/")
+            });
+
+            var groups = config.GroupByWallet();
+
+            Assert.Equal(2, groups.Count);
+            var sharedGroup = Assert.Single(groups, g => g.CryptoCodes.Count == 2);
+            Assert.Contains("ZANO", sharedGroup.CryptoCodes);
+            Assert.Contains("ZANOTEST", sharedGroup.CryptoCodes);
+            Assert.Equal("http://localhost:11212/", sharedGroup.WalletKey);
+
+            var altGroup = Assert.Single(groups, g => g.CryptoCodes.Count == 1);
+            Assert.Equal("ZANOALT", altGroup.CryptoCodes[0]);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void GroupByWallet_TreatsUriCaseInsensitively()
+        {
+            var config = new ZanoConfiguration();
+            config.ZanoConfigurationItems.Add("ZANO", new ZanoConfigurationItem
+            {
+                InternalWalletRpcUri = new Uri("http://LocalHost:11212/")
+            });
+            config.ZanoConfigurationItems.Add("ZANOTEST", new ZanoConfigurationItem
+            {
+                InternalWalletRpcUri = new Uri("http://localhost:11212/")
+            });
+
+            var groups = config.GroupByWallet();
+
+            var group = Assert.Single(groups);
+            Assert.Equal(2, group.CryptoCodes.Count);
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
         public void ZanoConfiguration_ShouldHandleDuplicateKeys()
         {
             var config = new ZanoConfiguration();

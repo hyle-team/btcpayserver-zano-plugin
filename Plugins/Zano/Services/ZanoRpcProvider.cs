@@ -47,10 +47,20 @@ namespace BTCPayServer.Plugins.Zano.Services
             return Summaries.ContainsKey(cryptoCode) && IsAvailable(Summaries[cryptoCode]);
         }
 
+        // The wallet reports a top-block-INDEX height while the daemon's getinfo.height is
+        // chain SIZE (index + 1), so a fully-synced wallet reads exactly 1 behind. Allow a
+        // small extra margin for a block arriving between the daemon and wallet probes;
+        // beyond that the wallet is genuinely lagging/rescanning and its transfer history is
+        // not yet authoritative — treating it as available would miss recent payments and let
+        // confirmations be counted off the daemon's higher height.
+        private const long MaxWalletBehindBlocks = 5;
+
         private bool IsAvailable(ZanoSummary summary)
         {
             return summary.Synced &&
-                   summary.WalletAvailable;
+                   summary.WalletAvailable &&
+                   summary.WalletHeight > 0 &&
+                   summary.WalletHeight >= summary.CurrentHeight - MaxWalletBehindBlocks;
         }
 
         public async Task<ZanoSummary> UpdateSummary(string cryptoCode)
