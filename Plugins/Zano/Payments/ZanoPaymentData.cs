@@ -14,7 +14,9 @@ namespace BTCPayServer.Plugins.Zano.Payments
         // this payment and the daemon's targeted get_tx_details lookup confirmed that
         // the transaction is absent from both chain and mempool. Reset when either
         // source sees the transaction again. At the threshold the payment becomes
-        // Unaccounted and a terminal settled invoice is reopened for recalculation.
+        // Unaccounted (the invoice itself is never rewritten — BTCPay has no valid
+        // path out of Settled; the listener logs critical and relies on the payment
+        // row for the merchant-visible signal).
         public int MissingPollCount { get; set; } = 0;
     }
 }

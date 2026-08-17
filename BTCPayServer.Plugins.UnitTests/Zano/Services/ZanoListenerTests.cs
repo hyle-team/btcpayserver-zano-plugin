@@ -7,6 +7,8 @@ using BTCPayServer.Plugins.Zano.Payments;
 using BTCPayServer.Plugins.Zano.RPC.Models;
 using BTCPayServer.Plugins.Zano.Services;
 
+using Newtonsoft.Json.Linq;
+
 using Xunit;
 
 namespace BTCPayServer.Plugins.UnitTests.Zano.Services
@@ -324,14 +326,18 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             Assert.False(ZanoListener.IsHeightLockedUnconfirmed(new ZanoPaymentData { BlockHeight = 0, LockTime = 1_700_000_000L }));  // timestamp form
         }
 
+        // Only SETTLED payments may be unaccounted by drop-detection. Unaccounting a
+        // Processing (unconfirmed) payment on mempool churn reverts a still-payable
+        // invoice to New and invites a double payment while the original tx can still
+        // confirm — the old (Processing or Settled) scope was a regression vector.
         [Trait("Category", "Unit")]
         [Theory]
-        [InlineData(PaymentStatus.Processing, 4, false)]
         [InlineData(PaymentStatus.Settled, 4, false)]
-        [InlineData(PaymentStatus.Processing, 5, true)]
         [InlineData(PaymentStatus.Settled, 5, true)]
+        [InlineData(PaymentStatus.Settled, 6, true)]
+        [InlineData(PaymentStatus.Processing, 5, false)]
         [InlineData(PaymentStatus.Unaccounted, 5, false)]
-        public void ShouldUnaccountMissingPayment_RequiresThresholdAndAccountedStatus(
+        public void ShouldUnaccountMissingPayment_RequiresThresholdAndSettledStatus(
             PaymentStatus status,
             int missingPollCount,
             bool expected)
@@ -339,18 +345,62 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             Assert.Equal(expected, ZanoListener.ShouldUnaccountMissingPayment(status, missingPollCount));
         }
 
+        // Tri-state contract for get_tx_details replies: only a structurally valid OK
+        // response (status OK + tx_info) proves existence; everything else that the
+        // daemon can answer with HTTP 200 is INCONCLUSIVE (null), never "absent".
+        // ("Absent" is exclusively the -14 error, handled by the caller's exception
+        // filter.) Regression guard: the old mapping returned false for null results
+        // and non-OK statuses, letting ~75s of degraded proxy replies unaccount a
+        // settled payment.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_ValidOkWithTxInfo_IsTrue()
+        {
+            var response = new GetTxDetailsResponse { Status = "OK", TxInfo = new JObject() };
+            Assert.True(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_OkStatusIsCaseInsensitive()
+        {
+            var response = new GetTxDetailsResponse { Status = "ok", TxInfo = new JObject() };
+            Assert.True(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_NullResponse_IsInconclusive()
+        {
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(null));
+        }
+
         [Trait("Category", "Unit")]
         [Theory]
-        [InlineData(InvoiceStatus.Settled, InvoiceExceptionStatus.None, true)]
-        [InlineData(InvoiceStatus.Settled, InvoiceExceptionStatus.PaidOver, true)]
-        [InlineData(InvoiceStatus.Settled, InvoiceExceptionStatus.Marked, false)]
-        [InlineData(InvoiceStatus.Processing, InvoiceExceptionStatus.None, false)]
-        public void ShouldReopenSettledInvoice_PreservesManualCompletion(
-            InvoiceStatus status,
-            InvoiceExceptionStatus exceptionStatus,
-            bool expected)
+        [InlineData("")]
+        [InlineData("BUSY")]
+        [InlineData("CORE_BUSY")]
+        [InlineData("INTERNAL_ERROR")]
+        public void ClassifyTxDetailsResponse_NonOkStatus_IsInconclusive(string status)
         {
-            Assert.Equal(expected, ZanoListener.ShouldReopenSettledInvoice(status, exceptionStatus));
+            var response = new GetTxDetailsResponse { Status = status, TxInfo = new JObject() };
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_MissingStatus_IsInconclusive()
+        {
+            var response = new GetTxDetailsResponse { Status = null, TxInfo = new JObject() };
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyTxDetailsResponse_OkWithoutTxInfo_IsInconclusive()
+        {
+            var response = new GetTxDetailsResponse { Status = "OK", TxInfo = null };
+            Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
         }
     }
 }

@@ -31,7 +31,11 @@ namespace BTCPayServer.Plugins.Zano.RPC
         private static readonly HashSet<string> FastMethods = new(StringComparer.OrdinalIgnoreCase)
         {
             "getinfo",
-            "get_wallet_info"
+            "get_wallet_info",
+            // Point lookup of a single tx — answers in milliseconds on a healthy
+            // daemon. The default 30s budget let one wedged daemon consume up to
+            // ~90s (with retries) per probed payment inside the wallet-scan lock.
+            "get_tx_details"
         };
 
         private static readonly HashSet<string> SlowMethods = new(StringComparer.OrdinalIgnoreCase)
