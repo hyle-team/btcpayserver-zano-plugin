@@ -27,5 +27,17 @@ namespace BTCPayServer.Plugins.Zano.Payments
         // original anchor. Null on rows written before this field existed — those
         // fall back to the row's Created time.
         public long? SettledAt { get; set; }
+
+        // Unix seconds when the payment last became Unaccounted (a lost transaction).
+        // Identifies the loss EPISODE: it is part of the merchant notification's
+        // de-duplication key so a later Lost→Restored→Lost cycle alerts again, and it
+        // bounds how long an Unaccounted row stays eligible for daemon recovery.
+        public long? UnaccountedAt { get; set; }
+
+        // True once the PaymentLost notification for the current UnaccountedAt episode
+        // has been persisted by BTCPay's notification store. False (or absent) means
+        // delivery is still owed and is retried on later passes — the loss alert must
+        // not depend on a single in-process attempt succeeding.
+        public bool LossNotified { get; set; }
     }
 }

@@ -53,9 +53,12 @@ namespace BTCPayServer.Plugins.Zano.Services
                     Kind.ConfirmationsRegressed =>
                         $"Zano payment on SETTLED invoice {n.InvoiceId} fell below its confirmation policy " +
                         $"(tx {Short(n.TransactionId)}, {n.Confirmations} conf) — likely a chain reorganization. Review before fulfilling.",
-                    Kind.PaymentRestored =>
+                    Kind.PaymentRestored when n.BlockHeight > 0 =>
                         $"Previously lost Zano payment on invoice {n.InvoiceId} is back on chain " +
-                        $"(tx {Short(n.TransactionId)}) and has been restored to accounting.",
+                        $"(tx {Short(n.TransactionId)}, height {n.BlockHeight}, {n.Confirmations} conf) and has been restored to accounting.",
+                    Kind.PaymentRestored =>
+                        $"Previously lost Zano payment on invoice {n.InvoiceId} reappeared in the mempool " +
+                        $"(tx {Short(n.TransactionId)}, unconfirmed) and is back in accounting as Processing until it confirms.",
                     _ => $"Zano reconciliation event on invoice {n.InvoiceId}."
                 };
                 vm.ActionLink = _linkGenerator.GetPathByAction(
@@ -71,11 +74,20 @@ namespace BTCPayServer.Plugins.Zano.Services
         public string InvoiceId { get; set; }
         public string TransactionId { get; set; }
         public long Confirmations { get; set; }
+        public long BlockHeight { get; set; }
         public Kind EventKind { get; set; }
 
-        // One notification per (invoice, tx, kind): the identifier is what BTCPay's
-        // notification store de-duplicates on, so repeated polls cannot spam.
-        public override string Identifier => $"{TYPE}_{EventKind}_{InvoiceId}_{TransactionId}";
+        // Distinguishes EPISODES of the same kind for the same payment (e.g. lost,
+        // restored, lost again). Callers set it from a persisted per-episode value
+        // (UnaccountedAt for a loss) or from the observed placement (for a
+        // regression), so a retried send of the same episode de-duplicates while a
+        // genuinely new episode alerts again.
+        public string Episode { get; set; }
+
+        // BTCPay's notification store de-duplicates on Identifier: one row per
+        // (kind, invoice, tx, episode). Repeated polls of the same episode cannot
+        // spam; a new episode is a new alert.
+        public override string Identifier => $"{TYPE}_{EventKind}_{InvoiceId}_{TransactionId}_{Episode}";
         public override string NotificationType => TYPE;
     }
 }

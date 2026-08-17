@@ -472,5 +472,94 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             Assert.True(ZanoListener.IsInReconciliationTail(late, now, now));
             Assert.True(ZanoListener.IsInReconciliationTail(past, now, now));
         }
+
+        // get_bulk_payments tri-state: null result = inconclusive; a result object with
+        // no payments key = genuinely empty (epee omits empty containers) = conclusive
+        // "not listed"; otherwise the exact tx hash must be present.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyBulkPaymentsResponse_NullResult_IsInconclusive()
+        {
+            Assert.Null(ZanoListener.ClassifyBulkPaymentsResponse(null, "tx1"));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyBulkPaymentsResponse_MissingPaymentsKey_IsNotListed()
+        {
+            Assert.False(ZanoListener.ClassifyBulkPaymentsResponse(new GetBulkPaymentsResponse { Payments = null }, "tx1"));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ClassifyBulkPaymentsResponse_MatchesTxHashCaseInsensitively()
+        {
+            var r = new GetBulkPaymentsResponse
+            {
+                Payments = new List<Payment> { new() { TxHash = "ABC123", PaymentId = "pid1", BlockHeight = 0 } }
+            };
+            Assert.True(ZanoListener.ClassifyBulkPaymentsResponse(r, "abc123"));
+            Assert.False(ZanoListener.ClassifyBulkPaymentsResponse(r, "other"));
+        }
+
+        // Selection is decided from durable per-payment state, never from memory:
+        // settlement window, in-flight miss sequence, unaccounted-within-recovery, or an
+        // undelivered loss alert.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NeedsReconciliation_InFlightMissSequence_StaysEligiblePastWindow()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData { SettledAt = now.AddDays(-5).ToUnixTimeSeconds(), MissingPollCount = 3 };
+            Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Settled, d, now.AddDays(-6), now));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NeedsReconciliation_UnaccountedInsideRecoveryWindow_IsEligible()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData
+            {
+                SettledAt = now.AddDays(-10).ToUnixTimeSeconds(),
+                UnaccountedAt = now.AddDays(-2).ToUnixTimeSeconds(),
+                LossNotified = true
+            };
+            Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-11), now));
+            d.UnaccountedAt = now.AddDays(-8).ToUnixTimeSeconds();
+            Assert.False(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-11), now));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NeedsReconciliation_UndeliveredLossAlert_IsEligibleRegardlessOfAge()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData
+            {
+                SettledAt = now.AddDays(-20).ToUnixTimeSeconds(),
+                UnaccountedAt = now.AddDays(-15).ToUnixTimeSeconds(),
+                LossNotified = false
+            };
+            Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-21), now));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NeedsReconciliation_OldSettledNoState_IsNotEligible()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var d = new ZanoPaymentData { SettledAt = now.AddDays(-5).ToUnixTimeSeconds(), MissingPollCount = 0 };
+            Assert.False(ZanoListener.NeedsReconciliation(PaymentStatus.Settled, d, now.AddDays(-6), now));
+            Assert.False(ZanoListener.NeedsReconciliation(PaymentStatus.Settled, null, now.AddDays(-6), now));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void NeedsReconciliation_UnparseableBlobFallsBackToCreated()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Settled, null, now.AddHours(-1), now));
+        }
     }
 }
