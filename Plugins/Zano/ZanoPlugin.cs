@@ -99,6 +99,7 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
         services.AddHostedService<ZanoSummaryUpdaterHostedService>();
         services.AddHostedService<ZanoListener>();
         services.AddHostedService<ZanoLoadUpService>();
+        services.AddSingleton<INotificationHandler, ZanoPaymentReconciliationNotification.Handler>();
 
         services.AddUIExtension("store-wallets-nav", "/Views/Zano/StoreWalletsNavZanoExtension.cshtml");
         services.AddUIExtension("store-invoices-payments", "/Views/Zano/ViewZanoPaymentData.cshtml");

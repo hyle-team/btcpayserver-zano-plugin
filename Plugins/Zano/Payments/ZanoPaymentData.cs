@@ -18,5 +18,14 @@ namespace BTCPayServer.Plugins.Zano.Payments
         // path out of Settled; the listener logs critical and relies on the payment
         // row for the merchant-visible signal).
         public int MissingPollCount { get; set; } = 0;
+
+        // Unix seconds of the FIRST time this payment reached Settled. Anchors the
+        // post-settlement reconciliation window: protection must start when the
+        // merchant could first have shipped, not when the payment was first seen
+        // (settlement can lag detection by days under high thresholds or time
+        // locks). Never cleared once set, so a downgrade/restore cycle keeps the
+        // original anchor. Null on rows written before this field existed — those
+        // fall back to the row's Created time.
+        public long? SettledAt { get; set; }
     }
 }

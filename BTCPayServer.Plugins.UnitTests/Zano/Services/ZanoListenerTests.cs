@@ -7,8 +7,6 @@ using BTCPayServer.Plugins.Zano.Payments;
 using BTCPayServer.Plugins.Zano.RPC.Models;
 using BTCPayServer.Plugins.Zano.Services;
 
-using Newtonsoft.Json.Linq;
-
 using Xunit;
 
 namespace BTCPayServer.Plugins.UnitTests.Zano.Services
@@ -356,7 +354,7 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
         [Fact]
         public void ClassifyTxDetailsResponse_ValidOkWithTxInfo_IsTrue()
         {
-            var response = new GetTxDetailsResponse { Status = "OK", TxInfo = new JObject() };
+            var response = new GetTxDetailsResponse { Status = "OK", TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
             Assert.True(ZanoListener.ClassifyTxDetailsResponse(response));
         }
 
@@ -364,7 +362,7 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
         [Fact]
         public void ClassifyTxDetailsResponse_OkStatusIsCaseInsensitive()
         {
-            var response = new GetTxDetailsResponse { Status = "ok", TxInfo = new JObject() };
+            var response = new GetTxDetailsResponse { Status = "ok", TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
             Assert.True(ZanoListener.ClassifyTxDetailsResponse(response));
         }
 
@@ -383,7 +381,7 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
         [InlineData("INTERNAL_ERROR")]
         public void ClassifyTxDetailsResponse_NonOkStatus_IsInconclusive(string status)
         {
-            var response = new GetTxDetailsResponse { Status = status, TxInfo = new JObject() };
+            var response = new GetTxDetailsResponse { Status = status, TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
             Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
         }
 
@@ -391,7 +389,7 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
         [Fact]
         public void ClassifyTxDetailsResponse_MissingStatus_IsInconclusive()
         {
-            var response = new GetTxDetailsResponse { Status = null, TxInfo = new JObject() };
+            var response = new GetTxDetailsResponse { Status = null, TxInfo = new GetTxDetailsTxInfo { KeeperBlock = 100 } };
             Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
         }
 
@@ -401,6 +399,78 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
         {
             var response = new GetTxDetailsResponse { Status = "OK", TxInfo = null };
             Assert.Null(ZanoListener.ClassifyTxDetailsResponse(response));
+        }
+
+        // Recovery must never trust the pre-drop record. keeper_block > 0 = confirmed
+        // at that height; -1 = pool only → zero confirmations, Processing at most.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ApplyRecoveredPlacement_ConfirmedTx_RecomputesFromKeeperBlock()
+        {
+            var details = new ZanoPaymentData { BlockHeight = 100, ConfirmationCount = 50 };
+            ZanoListener.ApplyRecoveredPlacement(details, keeperBlock: 120, currentHeight: 123);
+            Assert.Equal(120L, details.BlockHeight);
+            Assert.Equal(3L, details.ConfirmationCount);
+        }
+
+        [Trait("Category", "Unit")]
+        [Theory]
+        [InlineData(-1L)]
+        [InlineData(0L)]
+        [InlineData(null)]
+        public void ApplyRecoveredPlacement_PoolOrUnknown_ZeroesConfirmations(long? keeperBlock)
+        {
+            var details = new ZanoPaymentData { BlockHeight = 100, ConfirmationCount = 50 };
+            ZanoListener.ApplyRecoveredPlacement(details, keeperBlock, currentHeight: 123);
+            Assert.Equal(0L, details.BlockHeight);
+            Assert.Equal(0L, details.ConfirmationCount);
+            Assert.False(ZanoListener.GetStatus(details, SpeedPolicy.MediumSpeed, nowUnixSeconds: 1_700_000_000L));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void ApplyRecoveredPlacement_ReorgBelowTip_ClampsToZero()
+        {
+            var details = new ZanoPaymentData();
+            ZanoListener.ApplyRecoveredPlacement(details, keeperBlock: 130, currentHeight: 123);
+            Assert.Equal(0L, details.ConfirmationCount);
+        }
+
+        // Window is anchored on first settlement when known; Created is only a fallback
+        // for rows written before SettledAt existed.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsWithinReconciliationWindow_UsesSettledAtOverCreated()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var createdLongAgo = now.AddDays(-10);
+            var settledRecently = now.AddHours(-1).ToUnixTimeSeconds();
+            Assert.True(ZanoListener.IsWithinReconciliationWindow(settledRecently, createdLongAgo, now));
+            Assert.False(ZanoListener.IsWithinReconciliationWindow(null, createdLongAgo, now));
+        }
+
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsWithinReconciliationWindow_SettledAtPastWindow_IsFalse()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var settledOld = now.AddHours(-49).ToUnixTimeSeconds();
+            Assert.False(ZanoListener.IsWithinReconciliationWindow(settledOld, now.AddMinutes(-5), now));
+        }
+
+        // Cached daemon positives are bypassed in the last (TTL + threshold polls) of
+        // the window so a drop there can still accumulate conclusive misses.
+        [Trait("Category", "Unit")]
+        [Fact]
+        public void IsInReconciliationTail_TrueNearWindowEnd_FalseEarly()
+        {
+            var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
+            var early = new ZanoPaymentData { SettledAt = now.AddHours(-1).ToUnixTimeSeconds() };
+            var late = new ZanoPaymentData { SettledAt = now.AddHours(-48).AddMinutes(3).ToUnixTimeSeconds() };
+            var past = new ZanoPaymentData { SettledAt = now.AddHours(-50).ToUnixTimeSeconds() };
+            Assert.False(ZanoListener.IsInReconciliationTail(early, now, now));
+            Assert.True(ZanoListener.IsInReconciliationTail(late, now, now));
+            Assert.True(ZanoListener.IsInReconciliationTail(past, now, now));
         }
     }
 }

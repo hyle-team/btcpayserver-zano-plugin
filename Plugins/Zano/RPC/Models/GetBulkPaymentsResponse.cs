@@ -11,7 +11,7 @@ namespace BTCPayServer.Plugins.Zano.RPC.Models
 
     public class Payment
     {
-        [JsonProperty("amount")] public long Amount { get; set; }
+        [JsonProperty("amount")] public decimal Amount { get; set; }
         [JsonProperty("block_height")] public long BlockHeight { get; set; }
         [JsonProperty("payment_id")] public string PaymentId { get; set; }
         [JsonProperty("tx_hash")] public string TxHash { get; set; }

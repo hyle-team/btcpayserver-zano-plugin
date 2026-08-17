@@ -35,7 +35,9 @@ namespace BTCPayServer.Plugins.Zano.RPC
             // Point lookup of a single tx — answers in milliseconds on a healthy
             // daemon. The default 30s budget let one wedged daemon consume up to
             // ~90s (with retries) per probed payment inside the wallet-scan lock.
-            "get_tx_details"
+            "get_tx_details",
+            // Targeted wallet lookup by payment id — same point-query profile.
+            "get_bulk_payments"
         };
 
         private static readonly HashSet<string> SlowMethods = new(StringComparer.OrdinalIgnoreCase)
@@ -60,6 +62,7 @@ namespace BTCPayServer.Plugins.Zano.RPC
             "get_wallet_info",
             "get_recent_txs_and_info2",
             "get_tx_details",
+            "get_bulk_payments",
             "get_asset_info",
             "make_integrated_address",
             "open_wallet"
