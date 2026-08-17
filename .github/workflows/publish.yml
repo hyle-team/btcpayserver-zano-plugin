@@ -3,7 +3,11 @@ name: Publish Plugin on Tag
 on:
   push:
     tags:
-      - '[0-9]+.[0-9]+.[0-9]+'
+      # GitHub tag filters are globs, not regex: '+' is a literal character, so the
+      # old '[0-9]+.[0-9]+.[0-9]+' pattern could never match a real tag. Repo tags
+      # are v-prefixed semver (v1.1.0, v2.4.2); match those, with or without the v.
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - '[0-9]*.[0-9]*.[0-9]*'
 
 jobs:
   build-plugin:
@@ -16,13 +20,17 @@ jobs:
       - name: Extract GitRef (version tag)
         run: echo "GIT_REF=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
 
+      # No -v: verbose curl prints the Authorization header, and Actions' secret
+      # masking does not cover the base64 of the combined user:pass pair (it only
+      # masks each secret and its own encodings). -f fails the job on an HTTP
+      # error status; -sS stays quiet except for real errors.
       - name: Call API to create a build
         run: |
-          curl -v -X POST "https://plugin-builder.btcpayserver.org/api/v1/plugins/${{ env.pluginSlug }}/builds" \
+          curl -fsS -X POST "https://plugin-builder.btcpayserver.org/api/v1/plugins/${{ env.pluginSlug }}/builds" \
           -H "Content-Type: application/json" \
           -H "Authorization: Basic $(echo -n '${{ secrets.API_USERNAME }}:${{ secrets.API_PASSWORD }}' | base64)" \
           -d '{
             "GitRef": "${{ env.GIT_REF }}"
           }'
         env:
-          pluginSlug: "zano-plugin" 
+          pluginSlug: "zano-plugin"
