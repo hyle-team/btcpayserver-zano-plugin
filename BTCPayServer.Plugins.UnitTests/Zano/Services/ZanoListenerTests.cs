@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using BTCPayServer.Client.Models;
 using BTCPayServer.Data;
@@ -575,20 +576,36 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             Assert.Equal("L2", d.PendingAlerts[2].Episode);
         }
 
+        // The outbox bound must never lose an alert silently: every evicted record is
+        // returned to the caller (which logs it with invoice/payment identity), and
+        // nothing is evicted until the bound is actually exceeded.
         [Trait("Category", "Unit")]
         [Fact]
-        public void QueueAlert_IsBoundedDroppingOldest()
+        public void QueueAlert_IsBounded_AndReportsEveryEvictedRecord()
         {
             var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
             var d = new ZanoPaymentData();
+            var evictedAll = new List<ZanoPendingAlert>();
             for (var i = 1; i <= 40; i++)
             {
                 d.RegressionEpisode = i;
-                ZanoListener.QueueAlert(d, ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed, PaymentStatus.Processing, now);
+                var evicted = ZanoListener.QueueAlert(d, ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed, PaymentStatus.Processing, now);
+                if (i <= 32)
+                {
+                    Assert.Empty(evicted);
+                }
+                else
+                {
+                    Assert.Single(evicted);
+                    Assert.Equal($"G{i - 32}", evicted[0].Episode);
+                }
+                evictedAll.AddRange(evicted);
             }
             Assert.Equal(32, d.PendingAlerts.Count);
             Assert.Equal("G9", d.PendingAlerts[0].Episode);
             Assert.Equal("G40", d.PendingAlerts[^1].Episode);
+            Assert.Equal(8, evictedAll.Count);
+            Assert.Equal(new[] { "G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8" }, evictedAll.Select(e => e.Episode).ToArray());
         }
 
         // Fair progress: the next pass starts right after the last row a probe was

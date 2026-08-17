@@ -655,7 +655,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                             existingDetails.SettledAt ??= now.ToUnixTimeSeconds();
                         }
                         existingDetails.MissingPollCount = 0;
-                        QueueAlert(existingDetails, ZanoPaymentReconciliationNotification.Kind.PaymentRestored, existing.Status, now);
+                        QueueAlertLogged(invoice, existingDetails, ZanoPaymentReconciliationNotification.Kind.PaymentRestored, existing.Status, now);
                         RefreshReconciliationActive(existingDetails, existing.Status, existing.ReceivedTime, now);
                         existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
                         updated.Add((existing, invoice));
@@ -714,7 +714,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     existingDetails.LossEpisode++;
                     // ConfirmationCount/BlockHeight are deliberately kept: they preserve
                     // the last known chain position for the merchant's review.
-                    QueueAlert(existingDetails, ZanoPaymentReconciliationNotification.Kind.PaymentLost, existing.Status, now);
+                    QueueAlertLogged(invoice, existingDetails, ZanoPaymentReconciliationNotification.Kind.PaymentLost, existing.Status, now);
                     _logger.LogCritical(
                         "Zano reconciliation: settled payment lost its transaction (absent from daemon chain+pool and from wallet after {Threshold} checks); payment marked Unaccounted but invoice {InvoiceId} REMAINS SETTLED — BTCPay cannot un-settle an invoice. Merchant alert queued (episode L{Episode}). pid={Pid} tx={Tx}",
                         DropDetectionThreshold, invoice.Id, existingDetails.LossEpisode, existingDetails.PaymentId, existingDetails.TransactionId);
@@ -772,10 +772,13 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         // Append an immutable alert record capturing the transition as it happened.
         // The outbox is bounded; if a merchant's notification store is down for so long
-        // that the bound is hit, the OLDEST record is dropped with an error log — the
-        // most recent transitions are the ones that describe the row's current state.
+        // that the bound is hit, the OLDEST records are evicted — the most recent
+        // transitions are the ones that describe the row's current state — and RETURNED
+        // so the caller, which knows the invoice and payment identity, can log every
+        // one of them at error level. Eviction is data loss on the merchant's only
+        // reconciliation-alert channel and must never happen silently.
         private const int MaxPendingAlerts = 32;
-        public static void QueueAlert(ZanoPaymentData details, ZanoPaymentReconciliationNotification.Kind kind, PaymentStatus status, DateTimeOffset now)
+        public static List<ZanoPendingAlert> QueueAlert(ZanoPaymentData details, ZanoPaymentReconciliationNotification.Kind kind, PaymentStatus status, DateTimeOffset now)
         {
             details.PendingAlerts ??= [];
             details.PendingAlerts.Add(new ZanoPendingAlert
@@ -789,9 +792,31 @@ namespace BTCPayServer.Plugins.Zano.Services
                 Status = status.ToString(),
                 QueuedAt = now.ToUnixTimeSeconds()
             });
+            var evicted = new List<ZanoPendingAlert>();
             while (details.PendingAlerts.Count > MaxPendingAlerts)
             {
+                evicted.Add(details.PendingAlerts[0]);
                 details.PendingAlerts.RemoveAt(0);
+            }
+            return evicted;
+        }
+
+        // Queue an alert on a payment and log every record the bounded outbox had to
+        // evict to make room, with enough identity to reconstruct what was lost.
+        private void QueueAlertLogged(
+            InvoiceEntity invoice,
+            ZanoPaymentData details,
+            ZanoPaymentReconciliationNotification.Kind kind,
+            PaymentStatus status,
+            DateTimeOffset now)
+        {
+            foreach (var dropped in QueueAlert(details, kind, status, now))
+            {
+                _logger.LogError(
+                    "Zano reconciliation: alert outbox for invoice {InvoiceId} pid={Pid} tx={Tx} exceeded {Max} undelivered records; EVICTED undelivered alert kind={Kind} episode={Episode} status={Status} h={Height} conf={Confirmations} queuedAt={QueuedAt}. The notification store has been rejecting alerts for a long time — check BTCPay notifications/DB health.",
+                    invoice.Id, details.PaymentId, details.TransactionId, MaxPendingAlerts,
+                    dropped.Kind, dropped.Episode, dropped.Status, dropped.BlockHeight, dropped.Confirmations,
+                    DateTimeOffset.FromUnixTimeSeconds(dropped.QueuedAt));
             }
         }
 
@@ -1431,7 +1456,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     if (alreadyExistingPayment.Status == PaymentStatus.Settled && status == PaymentStatus.Processing)
                     {
                         details.RegressionEpisode++;
-                        QueueAlert(details, ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed, status, DateTimeOffset.UtcNow);
+                        QueueAlertLogged(invoice, details, ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed, status, DateTimeOffset.UtcNow);
                         _logger.LogCritical(
                             "Zano reconciliation: payment on settled invoice {InvoiceId} fell below its confirmation policy (reorg?); payment downgraded to Processing but the invoice REMAINS SETTLED — BTCPay cannot un-settle an invoice. Merchant alert queued (episode {Episode}). tx={Tx} confirmations={Confirmations}",
                             invoice.Id, details.RegressionEpisode, txId, confirmations);
@@ -1444,7 +1469,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     // still-pending loss alert stays queued ahead of it: the delivery phase
                     // sends the loss first, then this restore, both under the same loss
                     // episode.
-                    QueueAlert(details, ZanoPaymentReconciliationNotification.Kind.PaymentRestored, status, DateTimeOffset.UtcNow);
+                    QueueAlertLogged(invoice, details, ZanoPaymentReconciliationNotification.Kind.PaymentRestored, status, DateTimeOffset.UtcNow);
                     _logger.LogWarning(
                         "Zano reconciliation: transaction reappeared in wallet history; restoring payment to {Status}; invoice={InvoiceId} tx={Tx} h={Height} conf={Confirmations}",
                         status, invoice.Id, txId, blockHeight, confirmations);
