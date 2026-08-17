@@ -1,5 +1,3 @@
-using System;
-
 using BTCPayServer.Plugins.Zano.Configuration;
 
 using Xunit;
