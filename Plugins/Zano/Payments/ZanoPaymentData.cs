@@ -1,3 +1,7 @@
+using System.Collections.Generic;
+
+using Newtonsoft.Json;
+
 namespace BTCPayServer.Plugins.Zano.Payments
 {
     public class ZanoPaymentData
@@ -35,27 +39,50 @@ namespace BTCPayServer.Plugins.Zano.Payments
         // ---- Merchant-alert outbox -------------------------------------------------
         // Every reconciliation transition that a merchant must hear about is recorded
         // HERE, in the same write as the state change, and delivered AFTER that write
-        // has committed. A pending flag stays set until BTCPay's notification store has
-        // accepted the alert, and is retried on later passes regardless of what the
-        // payment's status has become since — so a crash, a transient store failure,
-        // or a wallet-driven recovery landing before the retry cannot lose an alert.
-        // Episode counters make the notification identifiers deterministic across
-        // retries (same episode → de-duplicated) and distinct across genuine
-        // repetitions (lost → restored → lost again alerts twice).
+        // has committed. Each record is immutable: it carries the kind, a durable
+        // episode identifier, and a snapshot of the placement/status at the moment of
+        // the transition, so a delayed delivery reports what actually happened rather
+        // than the row's latest state. Records are delivered in order and removed one
+        // by one once BTCPay's notification store has accepted them; retries happen on
+        // later passes regardless of what the payment's status has become since — so
+        // a crash, a transient store failure, or a wallet-driven recovery landing
+        // before the retry cannot lose an alert, and a lost→restored→lost sequence
+        // while the store is down keeps all three.
 
-        // Number of times this payment has become Unaccounted. 0 = never.
+        // Number of times this payment has become Unaccounted. 0 = never. Identifies
+        // the loss episode; the matching restore is tied to the same number.
         public int LossEpisode { get; set; }
-        public bool LossAlertPending { get; set; }
-
-        // Set when the payment leaves Unaccounted (daemon- or wallet-driven recovery).
-        // Its identifier is tied to LossEpisode: it announces the end of THAT loss.
-        public bool RestoreAlertPending { get; set; }
 
         // Number of times this payment fell below its confirmation policy while its
         // invoice was already Settled (reorg). 0 = never.
         public int RegressionEpisode { get; set; }
-        public bool RegressionAlertPending { get; set; }
 
-        public bool HasPendingAlert => LossAlertPending || RestoreAlertPending || RegressionAlertPending;
+        public List<ZanoPendingAlert> PendingAlerts { get; set; }
+
+        [JsonIgnore]
+        public bool HasPendingAlert => PendingAlerts is { Count: > 0 };
+
+        // Durable "this row still needs reconciliation attention" marker, maintained
+        // by the listener on every write (see ZanoListener.RefreshReconciliationActive)
+        // and queryable server-side via JSONB containment. It lets selection find old
+        // rows with live state (a fresh SettledAt on a long-Processing payment, an
+        // in-flight miss sequence, an undelivered alert) without a time bound.
+        // Serialized only when true (default-value handling), so the containment
+        // predicate {"details":{"reconciliationActive":true}} matches exactly the
+        // rows that need it.
+        public bool ReconciliationActive { get; set; }
+    }
+
+    public class ZanoPendingAlert
+    {
+        // "PaymentLost" | "PaymentRestored" | "ConfirmationsRegressed"
+        public string Kind { get; set; }
+        // Durable episode identifier, e.g. "L2" (loss/restore #2) or "G1" (regression #1).
+        public string Episode { get; set; }
+        public long BlockHeight { get; set; }
+        public long Confirmations { get; set; }
+        // Payment status right after the transition, as text.
+        public string Status { get; set; }
+        public long QueuedAt { get; set; }
     }
 }
