@@ -1,4 +1,3 @@
-using BTCPayServer.Plugins.Zano.Services;
 using BTCPayServer.Rating;
 using BTCPayServer.Services.Rates;
 using BTCPayServer.Tests.Mocks;
