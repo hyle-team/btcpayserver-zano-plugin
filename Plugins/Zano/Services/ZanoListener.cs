@@ -207,9 +207,17 @@ namespace BTCPayServer.Plugins.Zano.Services
                 var (allTransfers, _) = await FetchWalletTransfersAsync(
                     walletRpcClient, walletClientCryptoCode, allPaymentIds, cancellationToken);
 
+                // ONE reconciliation deadline for the whole wallet group. Probes run
+                // while this wallet's scan lock is held, so their total wall-clock —
+                // including in-flight RPCs, which the linked token cancels — is capped
+                // here rather than per crypto. Anything not reached is retried next
+                // pass with nothing decided (see the fair-start cursor in the loop).
+                using var probeBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                probeBudget.CancelAfter(ProbeBudgetPerPass);
+
                 foreach (var ctx in perCrypto)
                 {
-                    await ProcessTransfersForCryptoAsync(ctx, allTransfers, cancellationToken);
+                    await ProcessTransfersForCryptoAsync(ctx, allTransfers, walletGroup.WalletKey, probeBudget.Token, cancellationToken);
                 }
             }
             finally
@@ -398,6 +406,8 @@ namespace BTCPayServer.Plugins.Zano.Services
         private async Task ProcessTransfersForCryptoAsync(
             CryptoScanContext ctx,
             List<ZanoTransfer> allTransfers,
+            string walletKey,
+            CancellationToken probeToken,
             CancellationToken cancellationToken)
         {
             long currentHeight = 0;
@@ -447,14 +457,13 @@ namespace BTCPayServer.Plugins.Zano.Services
             }
 
             var updatedPaymentEntities = new List<(PaymentEntity Payment, InvoiceEntity invoice)>();
-            var notifications = new List<ZanoPaymentReconciliationNotification>();
 
             var dedupedCandidates = AggregateCandidates(candidates);
 
-            // Candidates are processed SEQUENTIALLY. They share the update list and the
-            // notification list; concurrent tasks resuming after an await would race on
-            // them (the previous fire-and-WhenAll shape only worked because the update
-            // branch happened to have no await before its Add).
+            // Candidates are processed SEQUENTIALLY. They share the update list;
+            // concurrent tasks resuming after an await would race on it (the previous
+            // fire-and-WhenAll shape only worked because the update branch happened to
+            // have no await before its Add).
             foreach (var cand in dedupedCandidates)
             {
                 var matchingInvoice = ctx.ExpandedInvoices.FirstOrDefault(e =>
@@ -492,8 +501,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     cand.UnlockTime,
                     cand.AssetId,
                     matchingInvoice.Invoice,
-                    updatedPaymentEntities,
-                    notifications);
+                    updatedPaymentEntities);
             }
 
             // A history-window miss is never enough to invalidate a payment. Two
@@ -519,18 +527,28 @@ namespace BTCPayServer.Plugins.Zano.Services
             // then Expired on the next watcher pass when the invoice is underpaid, or
             // bounces back to Settled replaying Confirmed/Completed webhooks when
             // other payments still cover it. The merchant-facing signal is a
-            // store-scoped dashboard notification (delivered BEFORE the payment write and
-            // retried on later passes until the store has it) plus the critical log.
+            // store-scoped dashboard notification, recorded in the payment row as a
+            // pending alert in the SAME write as the transition and delivered after
+            // commit (see DeliverPendingAlertsAsync), plus the critical log.
             var matchedKeys = new HashSet<string>(
                 dedupedCandidates.Select(c => DropDetectionKey(c.TxHash, c.PaymentId, c.AssetId)),
                 StringComparer.OrdinalIgnoreCase);
             var probeCircuitOpen = false;
             var now = DateTimeOffset.UtcNow;
-            var probeBudget = System.Diagnostics.Stopwatch.StartNew();
 
-            foreach (var invoiceCtx in ctx.ExpandedInvoices)
+            // Fair start: rotate where probing begins each pass, so a slow row at the
+            // front cannot consume the budget every pass and starve the rows behind it.
+            var rows = ctx.ExpandedInvoices
+                .SelectMany(inv => inv.ExistingPayments.Select(p => (Invoice: inv.Invoice, Payment: p)))
+                .ToList();
+            var cursorKey = $"{walletKey}|{ctx.CryptoCode}";
+            var start = rows.Count == 0 ? 0 : _probeCursor.GetOrAdd(cursorKey, 0) % rows.Count;
+            int? firstSkipped = null;
+
+            for (var i = 0; i < rows.Count; i++)
             {
-                foreach (var existing in invoiceCtx.ExistingPayments)
+                var idx = (start + i) % rows.Count;
+                var (invoice, existing) = rows[idx];
                 {
                     var existingDetails = ctx.Handler.ParsePaymentDetails(existing.Details);
                     if (existingDetails == null)
@@ -550,31 +568,18 @@ namespace BTCPayServer.Plugins.Zano.Services
                         continue;
                     }
 
-                    // A loss alert that could not be persisted last time is owed
-                    // regardless of what the probes say now.
-                    if (existing.Status == PaymentStatus.Unaccounted && !existingDetails.LossNotified)
-                    {
-                        if (await SendReconciliationNotificationAsync(BuildNotification(
-                                invoiceCtx.Invoice, existingDetails,
-                                ZanoPaymentReconciliationNotification.Kind.PaymentLost)))
-                        {
-                            existingDetails.LossNotified = true;
-                            existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
-                            updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
-                        }
-                    }
-
                     // One inconclusive probe (transport failure, wedged endpoint,
                     // malformed reply) means the endpoint can't be trusted for the
                     // rest of this pass. Skipping the remaining probes is free — an
                     // inconclusive result changes no state — and it keeps a dead
                     // endpoint's timeout+retry budget from stalling the whole wallet
-                    // scan once per unmatched payment. The wall-clock budget bounds the
-                    // slow-but-conclusive case the same way: probes are reconciliation
-                    // work and must not hold the live wallet-scan lock indefinitely;
-                    // whatever is not reached this pass is simply retried next pass.
-                    if (probeCircuitOpen || probeBudget.Elapsed > ProbeBudgetPerPass)
+                    // scan once per unmatched payment. The wallet-group deadline
+                    // (probeToken) bounds the slow-but-conclusive case the same way,
+                    // cancelling in-flight RPCs; whatever is not reached this pass is
+                    // retried next pass, from where this pass stopped.
+                    if (probeCircuitOpen || probeToken.IsCancellationRequested)
                     {
+                        firstSkipped ??= idx;
                         continue;
                     }
 
@@ -585,10 +590,11 @@ namespace BTCPayServer.Plugins.Zano.Services
                     var allowCache = existing.Status != PaymentStatus.Unaccounted
                                      && !IsInReconciliationTail(existingDetails, existing.ReceivedTime, now);
                     var probe = await ProbeDaemonAsync(
-                        ctx.CryptoCode, existingDetails.TransactionId, allowCache, cancellationToken);
+                        ctx.CryptoCode, existingDetails.TransactionId, allowCache, probeToken, cancellationToken);
                     if (probe.Exists is null)
                     {
                         probeCircuitOpen = true;
+                        firstSkipped ??= idx;
                         continue;
                     }
 
@@ -598,11 +604,12 @@ namespace BTCPayServer.Plugins.Zano.Services
                         // re-mined after a reorg, or the earlier unaccounting was wrong).
                         // Its confirmations are recomputed from the daemon's own chain
                         // placement — never from the pre-drop record — so a pool-only
-                        // reappearance restores to Processing, not straight to Settled.
+                        // reappearance restores to Processing unless the policy is
+                        // zero-confirmation.
                         if (probe.Exists is true)
                         {
                             ApplyRecoveredPlacement(existingDetails, probe.KeeperBlock, currentHeight);
-                            existing.Status = GetStatus(existingDetails, invoiceCtx.Invoice.SpeedPolicy)
+                            existing.Status = GetStatus(existingDetails, invoice.SpeedPolicy)
                                 ? PaymentStatus.Settled
                                 : PaymentStatus.Processing;
                             if (existing.Status == PaymentStatus.Settled)
@@ -610,18 +617,12 @@ namespace BTCPayServer.Plugins.Zano.Services
                                 existingDetails.SettledAt ??= now.ToUnixTimeSeconds();
                             }
                             existingDetails.MissingPollCount = 0;
-                            // Restoration is announced before the write; if the write then
-                            // fails the merchant sees a benign early "restored" and the next
-                            // pass restores again under the same episode identifier.
-                            await SendReconciliationNotificationAsync(BuildNotification(
-                                invoiceCtx.Invoice, existingDetails,
-                                ZanoPaymentReconciliationNotification.Kind.PaymentRestored,
-                                episode: now.ToUnixTimeSeconds().ToString()));
+                            existingDetails.RestoreAlertPending = true;
                             existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
-                            updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
+                            updatedPaymentEntities.Add((existing, invoice));
                             _logger.LogWarning(
                                 "Zano reconciliation: transaction reappeared on daemon (keeper_block={KeeperBlock}); restoring payment to {Status}; invoice={InvoiceId} pid={Pid} tx={Tx}",
-                                probe.KeeperBlock, existing.Status, invoiceCtx.Invoice.Id, existingDetails.PaymentId, existingDetails.TransactionId);
+                                probe.KeeperBlock, existing.Status, invoice.Id, existingDetails.PaymentId, existingDetails.TransactionId);
                         }
                         continue;
                     }
@@ -632,7 +633,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                         {
                             existingDetails.MissingPollCount = 0;
                             existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
-                            updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
+                            updatedPaymentEntities.Add((existing, invoice));
                         }
                         continue;
                     }
@@ -640,25 +641,26 @@ namespace BTCPayServer.Plugins.Zano.Services
                     // Daemon says gone. Require the wallet to agree via a targeted
                     // lookup before it counts as a miss.
                     var walletHasTx = await WalletStillListsTransactionAsync(
-                        ctx.CryptoCode, existingDetails.PaymentId, existingDetails.TransactionId, cancellationToken);
+                        ctx.CryptoCode, existingDetails.PaymentId, existingDetails.TransactionId, probeToken, cancellationToken);
                     if (walletHasTx is null)
                     {
-                        // Wallet lookup failed: inconclusive; don't count, don't stall
-                        // the rest of the pass on the wallet either.
+                        // Wallet lookup failed or the deadline hit: inconclusive; don't
+                        // count, don't stall the rest of the pass on the wallet either.
                         probeCircuitOpen = true;
+                        firstSkipped ??= idx;
                         continue;
                     }
                     if (walletHasTx is true)
                     {
                         _logger.LogWarning(
                             "Zano reconciliation: daemon reports tx {Tx} not found but the wallet still lists it for pid={Pid} — endpoints diverge; leaving payment untouched (invoice={InvoiceId})",
-                            existingDetails.TransactionId, existingDetails.PaymentId, invoiceCtx.Invoice.Id);
+                            existingDetails.TransactionId, existingDetails.PaymentId, invoice.Id);
                         if (existingDetails.MissingPollCount != 0)
                         {
                             // Not a joint miss: the consecutive-miss sequence is broken.
                             existingDetails.MissingPollCount = 0;
                             existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
-                            updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
+                            updatedPaymentEntities.Add((existing, invoice));
                         }
                         continue;
                     }
@@ -669,30 +671,20 @@ namespace BTCPayServer.Plugins.Zano.Services
                     {
                         existing.Status = PaymentStatus.Unaccounted;
                         existingDetails.UnaccountedAt = now.ToUnixTimeSeconds();
+                        existingDetails.LossEpisode++;
+                        existingDetails.LossAlertPending = true;
+                        existingDetails.RestoreAlertPending = false;
                         // ConfirmationCount/BlockHeight are deliberately kept: they preserve
                         // the last known chain position for the merchant's review.
-                        // Alert BEFORE the write so a crash between the two leaves an
-                        // alert without state (benign, self-correcting) rather than state
-                        // without an alert (silent). LossNotified records the outcome so an
-                        // unpersisted alert is retried on later passes.
-                        existingDetails.LossNotified = await SendReconciliationNotificationAsync(BuildNotification(
-                            invoiceCtx.Invoice, existingDetails,
-                            ZanoPaymentReconciliationNotification.Kind.PaymentLost));
                         _logger.LogCritical(
-                            "Zano reconciliation: settled payment lost its transaction (absent from daemon chain+pool and from wallet after {Threshold} checks); payment marked Unaccounted but invoice {InvoiceId} REMAINS SETTLED — BTCPay cannot un-settle an invoice. Merchant notified={Notified}. pid={Pid} tx={Tx}",
-                            DropDetectionThreshold, invoiceCtx.Invoice.Id, existingDetails.LossNotified, existingDetails.PaymentId, existingDetails.TransactionId);
+                            "Zano reconciliation: settled payment lost its transaction (absent from daemon chain+pool and from wallet after {Threshold} checks); payment marked Unaccounted but invoice {InvoiceId} REMAINS SETTLED — BTCPay cannot un-settle an invoice. Merchant alert queued (episode {Episode}). pid={Pid} tx={Tx}",
+                            DropDetectionThreshold, invoice.Id, existingDetails.LossEpisode, existingDetails.PaymentId, existingDetails.TransactionId);
                     }
                     existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
-                    updatedPaymentEntities.Add((existing, invoiceCtx.Invoice));
+                    updatedPaymentEntities.Add((existing, invoice));
                 }
             }
-
-            // Notifications collected by the candidate path (confirmation regressions)
-            // go out before the write for the same reason as above.
-            foreach (var n in notifications)
-            {
-                await SendReconciliationNotificationAsync(n);
-            }
+            _probeCursor[cursorKey] = firstSkipped ?? 0;
 
             if (updatedPaymentEntities.Any())
             {
@@ -700,6 +692,77 @@ namespace BTCPayServer.Plugins.Zano.Services
                 foreach (var group in updatedPaymentEntities.GroupBy(e => e.invoice))
                 {
                     _eventAggregator.Publish(new InvoiceNeedUpdateEvent(group.Key.Id));
+                }
+            }
+
+            // Post-commit alert delivery: every pending alert recorded in a payment row
+            // — by this pass or any earlier one — is sent now, and the flag is cleared
+            // in a follow-up write only once the notification store accepted it.
+            await DeliverPendingAlertsAsync(ctx, cancellationToken);
+        }
+
+        // Delivers alerts recorded in payment rows and clears them once persisted by
+        // BTCPay's notification store. Runs after the state write, so an alert never
+        // exists without its state; a crash between the two just leaves the flag set
+        // and this method sends it on the next pass under the same episode identifier.
+        // Order per payment: loss before restore, so a Lost→Restored pair whose loss
+        // send failed earlier still arrives in the right sequence.
+        private async Task DeliverPendingAlertsAsync(CryptoScanContext ctx, CancellationToken cancellationToken)
+        {
+            var cleared = new List<PaymentEntity>();
+            foreach (var invoiceCtx in ctx.ExpandedInvoices)
+            {
+                foreach (var payment in invoiceCtx.ExistingPayments)
+                {
+                    var details = ctx.Handler.ParsePaymentDetails(payment.Details);
+                    if (details == null || !details.HasPendingAlert)
+                    {
+                        continue;
+                    }
+                    var changed = false;
+                    if (details.LossAlertPending
+                        && await SendReconciliationNotificationAsync(BuildNotification(
+                            invoiceCtx.Invoice, details, ZanoPaymentReconciliationNotification.Kind.PaymentLost, payment.Status)))
+                    {
+                        details.LossAlertPending = false;
+                        changed = true;
+                    }
+                    if (details.RestoreAlertPending && !details.LossAlertPending
+                        && await SendReconciliationNotificationAsync(BuildNotification(
+                            invoiceCtx.Invoice, details, ZanoPaymentReconciliationNotification.Kind.PaymentRestored, payment.Status)))
+                    {
+                        details.RestoreAlertPending = false;
+                        changed = true;
+                    }
+                    if (details.RegressionAlertPending
+                        && await SendReconciliationNotificationAsync(BuildNotification(
+                            invoiceCtx.Invoice, details, ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed, payment.Status)))
+                    {
+                        details.RegressionAlertPending = false;
+                        changed = true;
+                    }
+                    if (changed)
+                    {
+                        payment.Details = JToken.FromObject(details, ctx.Handler.Serializer);
+                        cleared.Add(payment);
+                    }
+                }
+            }
+            if (cleared.Count > 0)
+            {
+                try
+                {
+                    await _paymentService.UpdatePayments(cleared);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // The alert IS delivered; failing to clear the flag only means one
+                    // more (de-duplicated) send attempt next pass.
+                    _logger.LogWarning(ex, "Zano reconciliation: could not clear delivered alert flags; will retry");
                 }
             }
         }
@@ -724,10 +787,13 @@ namespace BTCPayServer.Plugins.Zano.Services
         private static readonly TimeSpan UnaccountedRecoveryWindow = TimeSpan.FromDays(7);
 
         // The SQL side can only see the row's Created and Status columns (SettledAt,
-        // MissingPollCount, UnaccountedAt live inside the payment blob), so candidates
-        // are pre-filtered by Created over a bounded look-back and the per-payment
-        // reconciliation state is applied in memory. Settlement lagging first detection
-        // by more than this is out of scope of reconciliation.
+        // MissingPollCount, alert flags live inside the payment blob), so SETTLED
+        // candidates are pre-filtered by Created over a bounded look-back and the
+        // per-payment reconciliation state is applied in memory. Non-Settled rows are
+        // selected regardless of age (see the query). The bound only matters for a
+        // payment that reaches Settled more than ~28 days after it was first recorded,
+        // which BTCPay's own invoice monitoring does not allow under any ordinary
+        // configuration (default MonitoringExpiration = 1 day past invoice expiry).
         private static readonly TimeSpan ReconciliationLookback = TimeSpan.FromDays(30);
 
         // The eligible-invoice set is recomputed at most this often per payment method:
@@ -738,10 +804,16 @@ namespace BTCPayServer.Plugins.Zano.Services
         private static readonly TimeSpan ReconciliationSelectionTtl = TimeSpan.FromSeconds(60);
         private readonly ConcurrentDictionary<string, (DateTimeOffset At, string[] InvoiceIds)> _reconciliationSelection = new(StringComparer.OrdinalIgnoreCase);
 
-        // Wall-clock cap on reconciliation probing per pass while the wallet-scan lock is
-        // held. Whatever is not reached is retried next pass; nothing is decided from a
-        // skipped probe.
+        // Wall-clock cap on reconciliation probing per wallet-group pass while the
+        // wallet-scan lock is held, enforced by a linked cancellation token that cancels
+        // in-flight RPCs at the deadline. Whatever is not reached is retried next pass
+        // starting from where this one stopped (see _probeCursor); nothing is decided
+        // from a skipped or cancelled probe.
         private static readonly TimeSpan ProbeBudgetPerPass = TimeSpan.FromSeconds(20);
+
+        // Per (wallet, crypto) index of the first row not reached last pass. In-memory
+        // only: it decides ORDER of work, never state, so losing it on restart is fine.
+        private readonly ConcurrentDictionary<string, int> _probeCursor = new(StringComparer.Ordinal);
 
         private const int TxNotFoundRpcErrorCode = -14;
 
@@ -836,11 +908,17 @@ namespace BTCPayServer.Plugins.Zano.Services
             try
             {
                 using var db = _invoiceRepository.DbContextFactory.CreateContext();
+                // Settled rows are bounded by Created (see ReconciliationLookback);
+                // rows that are NOT Settled (Unaccounted awaiting recovery or carrying an
+                // undelivered alert; Processing after a confirmation regression) are
+                // included regardless of age — they are rare and their reconciliation
+                // state must never be cut off by a time bound.
                 var rows = await db.Payments
                     .Where(p => p.PaymentMethodId == paymentMethod
-                                && p.Created.HasValue
-                                && p.Created.Value >= lookbackCutoff
-                                && p.InvoiceData.Status == settled)
+                                && p.InvoiceData.Status == settled
+                                && ((p.Created.HasValue && p.Created.Value >= lookbackCutoff)
+                                    || p.Status == PaymentStatus.Unaccounted
+                                    || p.Status == PaymentStatus.Processing))
                     .Select(p => new { p.InvoiceDataId, p.Created, p.Status, p.Blob2 })
                     .ToArrayAsync(cancellationToken);
 
@@ -857,7 +935,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     {
                         // Unparseable blob: fall back to the Created anchor below.
                     }
-                    if (NeedsReconciliation(row.Status, details, row.Created.Value, now))
+                    if (NeedsReconciliation(row.Status, details, row.Created ?? now, now))
                     {
                         eligible.Add(row.InvoiceDataId);
                     }
@@ -881,12 +959,16 @@ namespace BTCPayServer.Plugins.Zano.Services
         }
 
         // Per-payment eligibility, from durable state only:
+        //  - any merchant alert still undelivered (regardless of status or age), or
         //  - inside the settlement window (SettledAt, or Created for old rows), or
         //  - an in-flight sub-threshold miss sequence (never abandoned at the boundary), or
-        //  - Unaccounted and inside the recovery window, or
-        //  - Unaccounted with the loss alert still undelivered.
+        //  - Unaccounted and inside the recovery window.
         public static bool NeedsReconciliation(PaymentStatus? status, ZanoPaymentData details, DateTimeOffset created, DateTimeOffset now)
         {
+            if (details?.HasPendingAlert == true)
+            {
+                return true;
+            }
             if (IsWithinReconciliationWindow(details?.SettledAt, created, now))
             {
                 return true;
@@ -899,17 +981,11 @@ namespace BTCPayServer.Plugins.Zano.Services
             {
                 return true;
             }
-            if (status == PaymentStatus.Unaccounted)
+            if (status == PaymentStatus.Unaccounted
+                && details.UnaccountedAt.HasValue
+                && now - DateTimeOffset.FromUnixTimeSeconds(details.UnaccountedAt.Value) <= UnaccountedRecoveryWindow)
             {
-                if (!details.LossNotified)
-                {
-                    return true;
-                }
-                if (details.UnaccountedAt.HasValue
-                    && now - DateTimeOffset.FromUnixTimeSeconds(details.UnaccountedAt.Value) <= UnaccountedRecoveryWindow)
-                {
-                    return true;
-                }
+                return true;
             }
             return false;
         }
@@ -939,10 +1015,14 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         private readonly record struct DaemonProbeResult(bool? Exists, long? KeeperBlock);
 
+        // probeToken = wallet-group reconciliation deadline (cancels in-flight RPCs);
+        // cancellationToken = host shutdown. Deadline expiry is INCONCLUSIVE, shutdown
+        // propagates.
         private async Task<DaemonProbeResult> ProbeDaemonAsync(
             string cryptoCode,
             string transactionId,
             bool allowCache,
+            CancellationToken probeToken,
             CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(transactionId)
@@ -966,7 +1046,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                 var response = await daemonRpcClient.SendCommandAsync<GetTxDetailsRequest, GetTxDetailsResponse>(
                     "get_tx_details",
                     new GetTxDetailsRequest { TxHash = transactionId },
-                    cancellationToken);
+                    probeToken);
                 var classified = ClassifyTxDetailsResponse(response);
                 if (classified is true)
                 {
@@ -985,6 +1065,13 @@ namespace BTCPayServer.Plugins.Zano.Services
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 throw;
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation(
+                    "Zano reconciliation: probe budget exhausted before verifying {Tx} via {CryptoCode} daemon; deferred to next pass",
+                    transactionId, cryptoCode);
+                return new DaemonProbeResult(null, null);
             }
             catch (Exception ex)
             {
@@ -1005,6 +1092,7 @@ namespace BTCPayServer.Plugins.Zano.Services
             string cryptoCode,
             string paymentId,
             string transactionId,
+            CancellationToken probeToken,
             CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(paymentId)
@@ -1023,12 +1111,19 @@ namespace BTCPayServer.Plugins.Zano.Services
                         MinBlockHeight = 0,
                         AllowLockedTransactions = true
                     },
-                    cancellationToken);
+                    probeToken);
                 return ClassifyBulkPaymentsResponse(response, transactionId);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 throw;
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation(
+                    "Zano reconciliation: probe budget exhausted before wallet lookup for pid={Pid} via {CryptoCode}; deferred to next pass",
+                    paymentId, cryptoCode);
+                return null;
             }
             catch (Exception ex)
             {
@@ -1076,14 +1171,14 @@ namespace BTCPayServer.Plugins.Zano.Services
             }
         }
 
-        // Episode identity: a loss is identified by its UnaccountedAt; a regression by
-        // the observed placement (height/confirmations) so repeated flapping re-alerts
-        // rather than staying silent; callers pass an explicit episode for restores.
+        // Episode identity comes from the persisted counters in the payment row, so a
+        // retried send de-duplicates and a genuine repetition alerts again. A restore
+        // is tied to the loss it ends.
         private static ZanoPaymentReconciliationNotification BuildNotification(
             InvoiceEntity invoice,
             ZanoPaymentData details,
             ZanoPaymentReconciliationNotification.Kind kind,
-            string episode = null)
+            PaymentStatus currentStatus)
             => new()
             {
                 StoreId = invoice.StoreId,
@@ -1091,13 +1186,13 @@ namespace BTCPayServer.Plugins.Zano.Services
                 TransactionId = details.TransactionId,
                 Confirmations = details.ConfirmationCount,
                 BlockHeight = details.BlockHeight,
+                RestoredStatus = currentStatus.ToString(),
                 EventKind = kind,
-                Episode = episode ?? kind switch
+                Episode = kind switch
                 {
-                    ZanoPaymentReconciliationNotification.Kind.PaymentLost
-                        => (details.UnaccountedAt ?? 0).ToString(),
-                    ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed
-                        => $"h{details.BlockHeight}c{details.ConfirmationCount}",
+                    ZanoPaymentReconciliationNotification.Kind.PaymentLost => $"L{details.LossEpisode}",
+                    ZanoPaymentReconciliationNotification.Kind.PaymentRestored => $"L{details.LossEpisode}",
+                    ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed => $"G{details.RegressionEpisode}",
                     _ => "0"
                 }
             };
@@ -1154,11 +1249,10 @@ namespace BTCPayServer.Plugins.Zano.Services
         // above — i.e. only when the wallet still reports the transaction.
 
         // Called sequentially per candidate (see the caller). Appends to the shared
-        // update/notification lists; the caller sends notifications and commits.
+        // update list; alerts are recorded in the payment row and delivered after commit.
         private async Task HandlePaymentData(string cryptoCode, decimal totalAmount, string paymentId,
             string txId, long confirmations, long blockHeight, long locktime, string assetId, InvoiceEntity invoice,
-            List<(PaymentEntity Payment, InvoiceEntity invoice)> paymentsToUpdate,
-            List<ZanoPaymentReconciliationNotification> notifications)
+            List<(PaymentEntity Payment, InvoiceEntity invoice)> paymentsToUpdate)
         {
             var network = _networkProvider.GetNetwork(cryptoCode);
             var pmi = PaymentTypes.CHAIN.GetPaymentMethodId(network.CryptoCode);
@@ -1215,13 +1309,17 @@ namespace BTCPayServer.Plugins.Zano.Services
             else
             {
                 var oldDetails = handler.ParsePaymentDetails(alreadyExistingPayment.Details);
-                // Preserve the ORIGINAL settlement anchor and the loss-episode fields
-                // across rewrites; only stamp SettledAt when the row settles for the
-                // first time.
+                // Preserve the ORIGINAL settlement anchor and every durable
+                // reconciliation/alert field across rewrites; only stamp SettledAt when
+                // the row settles for the first time.
                 details.SettledAt = oldDetails?.SettledAt
                     ?? (status == PaymentStatus.Settled ? DateTimeOffset.UtcNow.ToUnixTimeSeconds() : null);
                 details.UnaccountedAt = oldDetails?.UnaccountedAt;
-                details.LossNotified = oldDetails?.LossNotified ?? false;
+                details.LossEpisode = oldDetails?.LossEpisode ?? 0;
+                details.LossAlertPending = oldDetails?.LossAlertPending ?? false;
+                details.RestoreAlertPending = oldDetails?.RestoreAlertPending ?? false;
+                details.RegressionEpisode = oldDetails?.RegressionEpisode ?? 0;
+                details.RegressionAlertPending = oldDetails?.RegressionAlertPending ?? false;
                 details.MissingPollCount = 0;
 
                 if (invoice.Status == InvoiceStatus.Settled)
@@ -1237,23 +1335,23 @@ namespace BTCPayServer.Plugins.Zano.Services
                     }
                     if (alreadyExistingPayment.Status == PaymentStatus.Settled && status == PaymentStatus.Processing)
                     {
+                        details.RegressionEpisode++;
+                        details.RegressionAlertPending = true;
                         _logger.LogCritical(
-                            "Zano reconciliation: payment on settled invoice {InvoiceId} fell below its confirmation policy (reorg?); payment downgraded to Processing but the invoice REMAINS SETTLED — BTCPay cannot un-settle an invoice. Merchant notified. tx={Tx} confirmations={Confirmations}",
-                            invoice.Id, txId, confirmations);
-                        notifications.Add(BuildNotification(
-                            invoice, details, ZanoPaymentReconciliationNotification.Kind.ConfirmationsRegressed));
+                            "Zano reconciliation: payment on settled invoice {InvoiceId} fell below its confirmation policy (reorg?); payment downgraded to Processing but the invoice REMAINS SETTLED — BTCPay cannot un-settle an invoice. Merchant alert queued (episode {Episode}). tx={Tx} confirmations={Confirmations}",
+                            invoice.Id, details.RegressionEpisode, txId, confirmations);
                     }
                 }
                 if (alreadyExistingPayment.Status == PaymentStatus.Unaccounted)
                 {
                     // Wallet-driven recovery: the wallet lists the transaction again, so
-                    // the row leaves Unaccounted with placement taken from the wallet.
+                    // the row leaves Unaccounted with placement taken from the wallet. Any
+                    // still-pending loss alert stays pending: the delivery phase sends the
+                    // loss first, then this restore, both under the same loss episode.
+                    details.RestoreAlertPending = true;
                     _logger.LogWarning(
                         "Zano reconciliation: transaction reappeared in wallet history; restoring payment to {Status}; invoice={InvoiceId} tx={Tx} h={Height} conf={Confirmations}",
                         status, invoice.Id, txId, blockHeight, confirmations);
-                    notifications.Add(BuildNotification(
-                        invoice, details, ZanoPaymentReconciliationNotification.Kind.PaymentRestored,
-                        episode: DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString()));
                 }
                 // Update existing payment with new confirmation data
                 alreadyExistingPayment.Status = status;

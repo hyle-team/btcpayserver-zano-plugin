@@ -55,10 +55,10 @@ namespace BTCPayServer.Plugins.Zano.Services
                         $"(tx {Short(n.TransactionId)}, {n.Confirmations} conf) — likely a chain reorganization. Review before fulfilling.",
                     Kind.PaymentRestored when n.BlockHeight > 0 =>
                         $"Previously lost Zano payment on invoice {n.InvoiceId} is back on chain " +
-                        $"(tx {Short(n.TransactionId)}, height {n.BlockHeight}, {n.Confirmations} conf) and has been restored to accounting.",
+                        $"(tx {Short(n.TransactionId)}, height {n.BlockHeight}, {n.Confirmations} conf) and is back in accounting as {n.RestoredStatus}.",
                     Kind.PaymentRestored =>
                         $"Previously lost Zano payment on invoice {n.InvoiceId} reappeared in the mempool " +
-                        $"(tx {Short(n.TransactionId)}, unconfirmed) and is back in accounting as Processing until it confirms.",
+                        $"(tx {Short(n.TransactionId)}, unconfirmed) and is back in accounting as {n.RestoredStatus}.",
                     _ => $"Zano reconciliation event on invoice {n.InvoiceId}."
                 };
                 vm.ActionLink = _linkGenerator.GetPathByAction(
@@ -75,13 +75,14 @@ namespace BTCPayServer.Plugins.Zano.Services
         public string TransactionId { get; set; }
         public long Confirmations { get; set; }
         public long BlockHeight { get; set; }
+        public string RestoredStatus { get; set; }
         public Kind EventKind { get; set; }
 
         // Distinguishes EPISODES of the same kind for the same payment (e.g. lost,
-        // restored, lost again). Callers set it from a persisted per-episode value
-        // (UnaccountedAt for a loss) or from the observed placement (for a
-        // regression), so a retried send of the same episode de-duplicates while a
-        // genuinely new episode alerts again.
+        // restored, lost again). Set from the persisted episode counters in the
+        // payment blob (LossEpisode / RegressionEpisode), so a retried send of the
+        // same episode de-duplicates while a genuinely new episode alerts again, and
+        // the identifier is stable across crashes and retries.
         public string Episode { get; set; }
 
         // BTCPay's notification store de-duplicates on Identifier: one row per

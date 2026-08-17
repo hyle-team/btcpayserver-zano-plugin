@@ -523,25 +523,37 @@ namespace BTCPayServer.Plugins.UnitTests.Zano.Services
             {
                 SettledAt = now.AddDays(-10).ToUnixTimeSeconds(),
                 UnaccountedAt = now.AddDays(-2).ToUnixTimeSeconds(),
-                LossNotified = true
+                LossEpisode = 1
             };
             Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-11), now));
             d.UnaccountedAt = now.AddDays(-8).ToUnixTimeSeconds();
             Assert.False(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-11), now));
         }
 
+        // Any undelivered merchant alert keeps the payment eligible regardless of its
+        // current status or age — the alert outbox must drain even after the payment
+        // was restored by the wallet or aged out of every window.
         [Trait("Category", "Unit")]
-        [Fact]
-        public void NeedsReconciliation_UndeliveredLossAlert_IsEligibleRegardlessOfAge()
+        [Theory]
+        [InlineData(PaymentStatus.Unaccounted, true, false, false)]
+        [InlineData(PaymentStatus.Settled, true, false, false)]
+        [InlineData(PaymentStatus.Settled, false, true, false)]
+        [InlineData(PaymentStatus.Processing, false, false, true)]
+        public void NeedsReconciliation_PendingAlert_IsEligibleRegardlessOfStatusOrAge(
+            PaymentStatus status, bool loss, bool restore, bool regression)
         {
             var now = new DateTimeOffset(2026, 8, 17, 12, 0, 0, TimeSpan.Zero);
             var d = new ZanoPaymentData
             {
                 SettledAt = now.AddDays(-20).ToUnixTimeSeconds(),
                 UnaccountedAt = now.AddDays(-15).ToUnixTimeSeconds(),
-                LossNotified = false
+                LossEpisode = 1,
+                LossAlertPending = loss,
+                RestoreAlertPending = restore,
+                RegressionAlertPending = regression
             };
-            Assert.True(ZanoListener.NeedsReconciliation(PaymentStatus.Unaccounted, d, now.AddDays(-21), now));
+            Assert.True(d.HasPendingAlert);
+            Assert.True(ZanoListener.NeedsReconciliation(status, d, now.AddDays(-21), now));
         }
 
         [Trait("Category", "Unit")]

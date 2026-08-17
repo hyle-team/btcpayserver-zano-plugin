@@ -29,15 +29,33 @@ namespace BTCPayServer.Plugins.Zano.Payments
         public long? SettledAt { get; set; }
 
         // Unix seconds when the payment last became Unaccounted (a lost transaction).
-        // Identifies the loss EPISODE: it is part of the merchant notification's
-        // de-duplication key so a later Lost→Restored→Lost cycle alerts again, and it
-        // bounds how long an Unaccounted row stays eligible for daemon recovery.
+        // Bounds how long an Unaccounted row stays eligible for daemon recovery.
         public long? UnaccountedAt { get; set; }
 
-        // True once the PaymentLost notification for the current UnaccountedAt episode
-        // has been persisted by BTCPay's notification store. False (or absent) means
-        // delivery is still owed and is retried on later passes — the loss alert must
-        // not depend on a single in-process attempt succeeding.
-        public bool LossNotified { get; set; }
+        // ---- Merchant-alert outbox -------------------------------------------------
+        // Every reconciliation transition that a merchant must hear about is recorded
+        // HERE, in the same write as the state change, and delivered AFTER that write
+        // has committed. A pending flag stays set until BTCPay's notification store has
+        // accepted the alert, and is retried on later passes regardless of what the
+        // payment's status has become since — so a crash, a transient store failure,
+        // or a wallet-driven recovery landing before the retry cannot lose an alert.
+        // Episode counters make the notification identifiers deterministic across
+        // retries (same episode → de-duplicated) and distinct across genuine
+        // repetitions (lost → restored → lost again alerts twice).
+
+        // Number of times this payment has become Unaccounted. 0 = never.
+        public int LossEpisode { get; set; }
+        public bool LossAlertPending { get; set; }
+
+        // Set when the payment leaves Unaccounted (daemon- or wallet-driven recovery).
+        // Its identifier is tied to LossEpisode: it announces the end of THAT loss.
+        public bool RestoreAlertPending { get; set; }
+
+        // Number of times this payment fell below its confirmation policy while its
+        // invoice was already Settled (reorg). 0 = never.
+        public int RegressionEpisode { get; set; }
+        public bool RegressionAlertPending { get; set; }
+
+        public bool HasPendingAlert => LossAlertPending || RestoreAlertPending || RegressionAlertPending;
     }
 }
