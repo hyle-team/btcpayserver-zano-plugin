@@ -1044,12 +1044,28 @@ namespace BTCPayServer.Plugins.Zano.Services
                                 && p.InvoiceData.Status == settled
                                 && ((p.Created.HasValue && p.Created.Value >= lookbackCutoff)
                                     || p.Status == PaymentStatus.Unaccounted
-                                    || p.Status == PaymentStatus.Processing
-                                    || EF.Functions.JsonContains(p.Blob2, ReconciliationActiveJson)))
+                                    || p.Status == PaymentStatus.Processing))
                     .Select(p => new { p.InvoiceDataId, p.Created, p.Status, p.Blob2 })
                     .ToArrayAsync(cancellationToken);
 
-                var eligible = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                // Marker admission via JSONB containment. Raw SQL rather than
+                // EF.Functions.JsonContains: BTCPay maps Blob2 with store type "JSONB"
+                // (upper case) and Npgsql's translation only accepts "jsonb", so the
+                // LINQ form throws at runtime. Rows matched here are eligible by
+                // definition (the marker IS "needs reconciliation"); a stale marker is
+                // cleared with a write by the reconcile pass.
+                var markerIds = await db.Database
+                    .SqlQuery<string>($"""
+                        SELECT p."InvoiceDataId" AS "Value"
+                        FROM "Payments" p
+                        JOIN "Invoices" i ON i."Id" = p."InvoiceDataId"
+                        WHERE p."PaymentMethodId" = {paymentMethod}
+                          AND i."Status" = {settled}
+                          AND p."Blob2" @> CAST({ReconciliationActiveJson} AS jsonb)
+                        """)
+                    .ToListAsync(cancellationToken);
+
+                var eligible = new HashSet<string>(markerIds, StringComparer.OrdinalIgnoreCase);
                 foreach (var row in rows)
                 {
                     ZanoPaymentData details = null;

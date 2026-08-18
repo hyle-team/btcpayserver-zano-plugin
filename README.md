@@ -125,7 +125,7 @@ docker run -d --name zano_wallet \
 
 ### Requirements
 
-- .NET 8.0 SDK
+- .NET 10.0 SDK
 - Git
 - Docker and Docker Compose
 
@@ -162,7 +162,7 @@ Create `appsettings.dev.json` in `btcpayserver/BTCPayServer`:
 
 ```json
 {
-  "DEBUG_PLUGINS": "../../Plugins/Zano/bin/Debug/net8.0/BTCPayServer.Plugins.Zano.dll",
+  "DEBUG_PLUGINS": "../../Plugins/Zano/bin/Debug/net10.0/BTCPayServer.Plugins.Zano.dll",
   "ZANO_DAEMON_URI": "http://127.0.0.1:11211",
   "ZANO_WALLET_DAEMON_URI": "http://127.0.0.1:11212"
 }

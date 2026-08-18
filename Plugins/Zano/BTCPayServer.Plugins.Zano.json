@@ -7,7 +7,7 @@
   "Dependencies": [
     {
       "Identifier": "BTCPayServer",
-      "Condition": ">=2.1.0"
+      "Condition": ">=2.4.2"
     }
   ],
   "Documentation": "https://github.com/hyle-team/btcpayserver-zano-plugin",
