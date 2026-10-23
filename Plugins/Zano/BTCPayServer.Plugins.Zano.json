@@ -1,13 +1,13 @@
 {
   "Identifier": "BTCPayServer.Plugins.Zano",
   "Name": "Zano",
-  "Version": "1.0.0",
+  "Version": "1.2.0",
   "Description": "Accept Zano (ZANO) payments in BTCPay Server. Privacy-focused cryptocurrency with confidential transactions.",
   "SystemPlugin": false,
   "Dependencies": [
     {
       "Identifier": "BTCPayServer",
-      "Condition": ">=2.1.0"
+      "Condition": ">=2.4.5"
     }
   ],
   "Documentation": "https://github.com/hyle-team/btcpayserver-zano-plugin",

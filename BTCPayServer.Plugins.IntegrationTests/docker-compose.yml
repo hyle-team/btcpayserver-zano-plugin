@@ -1,149 +1,60 @@
 services:
-
   tests:
     build:
       context: ..
       dockerfile: BTCPayServer.Plugins.IntegrationTests/Dockerfile
     environment:
-      TESTS_BTCRPCCONNECTION: server=http://bitcoind:43782;ceiwHEbqWI83:DwubwWsoo3
-      TESTS_BTCNBXPLORERURL: http://nbxplorer:32838/
+      BTCPAY_NODEFAULTCHAIN: "true"
       TESTS_POSTGRES: User ID=postgres;Include Error Detail=true;Host=postgres;Port=5432;Database=btcpayserver
-      TESTS_EXPLORER_POSTGRES: User ID=postgres;Include Error Detail=true;Host=postgres;Port=5432;Database=nbxplorer
       TESTS_HOSTNAME: tests
       TESTS_INCONTAINER: "true"
+      PLAYWRIGHT_HEADLESS: "true"
       BTCPAY_ZANO_DAEMON_URI: http://37.27.100.59:10505
       BTCPAY_ZANO_WALLET_DAEMON_URI: http://zano_wallet:11212
-      BTCPAY_ZANO_WALLET_DAEMON_WALLETDIR: /wallet
     depends_on:
-      - nbxplorer
-      - postgres
-      - zano_wallet
+      postgres:
+        condition: service_healthy
+      zano_wallet:
+        condition: service_healthy
     extra_hosts:
       - "tests:127.0.0.1"
     volumes:
       - ../coverage:/coverage
-      - zano_wallet:/wallet
-
-  # The dev container is not used, it is just handy to run `docker-compose up dev` to start all services
-  dev:
-    image: alpine:3.21
-    container_name: dev
-    command: [ "/bin/sh", "-c", "trap : TERM INT; while :; do echo Ready to code and debug like a rockstar!!!; sleep 2073600; done & wait" ]
-    depends_on:
-      - nbxplorer
-      - postgres
-      - zano_wallet
-
-  nbxplorer:
-    image: nicolasdorier/nbxplorer:2.5.25
-    container_name: nbxplorer
-    restart: unless-stopped
-    ports:
-      - "32838:32838"
-    expose:
-      - "32838"
-    environment:
-      NBXPLORER_NETWORK: regtest
-      NBXPLORER_CHAINS: "btc"
-      NBXPLORER_BTCRPCURL: http://bitcoind:43782/
-      NBXPLORER_BTCNODEENDPOINT: bitcoind:39388
-      NBXPLORER_BTCRPCUSER: ceiwHEbqWI83
-      NBXPLORER_BTCRPCPASSWORD: DwubwWsoo3
-      NBXPLORER_BIND: 0.0.0.0:32838
-      NBXPLORER_MINGAPSIZE: 5
-      NBXPLORER_MAXGAPSIZE: 10
-      NBXPLORER_VERBOSE: 1
-      NBXPLORER_POSTGRES: User ID=postgres;Include Error Detail=true;Host=postgres;Port=5432;Database=nbxplorer
-      NBXPLORER_EXPOSERPC: 1
-      NBXPLORER_NOAUTH: 1
-    depends_on:
-      - bitcoind
-
-  bitcoind:
-    restart: unless-stopped
-    image: btcpayserver/bitcoin:29.0
-    container_name: bitcoind
-    environment:
-      BITCOIN_NETWORK: regtest
-      BITCOIN_WALLETDIR: "/data/wallets"
-      BITCOIN_EXTRA_ARGS: |-
-        rpcuser=ceiwHEbqWI83
-        rpcpassword=DwubwWsoo3
-        rpcport=43782
-        rpcbind=0.0.0.0:43782
-        rpcallowip=0.0.0.0/0
-        port=39388
-        whitelist=0.0.0.0/0
-        zmqpubrawblock=tcp://0.0.0.0:28332
-        zmqpubrawtx=tcp://0.0.0.0:28333
-        deprecatedrpc=signrawtransaction
-        fallbackfee=0.0002
-    ports:
-      - "43782:43782"
-      - "39388:39388"
-    expose:
-      - "43782" # RPC
-      - "39388" # P2P
-      - "28332" # ZMQ
-      - "28333" # ZMQ
-    volumes:
-      - "bitcoin_datadir:/data"
-
-  zanod:
-    image: pavelravaga/zano:2.2.0.455
-    restart: unless-stopped
-    container_name: zanod
-    entrypoint: zanod
-    command: >
-      --rpc-bind-ip=0.0.0.0
-      --rpc-bind-port=11211
-      --log-level=2
-      --data-dir=/data
-    volumes:
-      - zano_data:/data
-    ports:
-      - "11211:11211"
 
   zano_wallet:
-    image: pavelravaga/zano:2.2.0.455
-    restart: unless-stopped
-    container_name: zano_wallet
+    image: pavelravaga/zano:2.2.1.502@sha256:5b2c8fbb7f5482b281318d264f7d887ca14400d4bd74cb7a7bcf3036aa443b37
     entrypoint: /bin/bash
     command:
-      - -c
+      - -ec
       - |
-        if [ ! -f /wallet/wallet.keys ]; then
-          echo "Generating new wallet..."
-          echo "exit" | simplewallet --generate-new-wallet=/wallet/wallet --password pass --daemon-address=37.27.100.59:10505
+        if [ ! -f /wallet/wallet ]; then
+          # The interactive exit command returns 1 even after generating the wallet.
+          echo exit | simplewallet --generate-new-wallet=/wallet/wallet --password=pass --daemon-address=37.27.100.59:10505 >/dev/null 2>&1 || test -s /wallet/wallet
         fi
-        simplewallet --wallet-file=/wallet/wallet --password pass --daemon-address=37.27.100.59:10505 --rpc-bind-ip=0.0.0.0 --rpc-bind-port=11212
-    ports:
-      - "11212:11212"
+        exec simplewallet --wallet-file=/wallet/wallet --password=pass --daemon-address=37.27.100.59:10505 --rpc-bind-ip=0.0.0.0 --rpc-bind-port=11212 --unsecure-no-auth
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS -X POST http://127.0.0.1:11212/json_rpc
+          -H 'Content-Type: application/json'
+          -d '{"jsonrpc":"2.0","id":0,"method":"get_wallet_info"}'
+          | grep -q '"address"'
+      interval: 5s
+      timeout: 10s
+      retries: 24
     volumes:
       - zano_wallet:/wallet
-    depends_on:
-      - zanod
 
   postgres:
     image: postgres:17.4
-    container_name: postgres
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
-    ports:
-      - "39372:5432"
-    expose:
-      - "5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
 volumes:
-  bitcoin_datadir:
-  zano_data:
   zano_wallet:
-
-networks:
-  default:
-    driver: bridge
-  custom:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.23.0.0/16

@@ -11,8 +11,11 @@ using BTCPayServer.Payments;
 using BTCPayServer.Plugins.Zano.Configuration;
 using BTCPayServer.Plugins.Zano.Payments;
 using BTCPayServer.Plugins.Zano.Services;
+using BTCPayServer.Plugins.Zano.Validation;
 using BTCPayServer.Services;
 using BTCPayServer.Services.Rates;
+
+using Microsoft.AspNetCore.Mvc;
 
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -30,7 +33,7 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
 
     public override IBTCPayServerPlugin.PluginDependency[] Dependencies { get; } =
     {
-        new IBTCPayServerPlugin.PluginDependency { Identifier = nameof(BTCPayServer), Condition = ">=2.1.0" }
+        new IBTCPayServerPlugin.PluginDependency { Identifier = nameof(BTCPayServer), Condition = ">=2.4.5" }
     };
 
     public override void Execute(IServiceCollection services)
@@ -99,6 +102,8 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
         services.AddHostedService<ZanoSummaryUpdaterHostedService>();
         services.AddHostedService<ZanoListener>();
         services.AddHostedService<ZanoLoadUpService>();
+        services.Configure<MvcOptions>(options =>
+            options.ModelMetadataDetailsProviders.Add(new InvoiceAmountValidationMetadataProvider()));
         services.AddSingleton<INotificationHandler, ZanoPaymentReconciliationNotification.Handler>();
 
         services.AddUIExtension("store-wallets-nav", "/Views/Zano/StoreWalletsNavZanoExtension.cshtml");

@@ -21,9 +21,9 @@
 		m.Amount = payment.Value.ToString(CultureInfo.InvariantCulture);
 
 		var confReq = ZanoListener.ConfirmationsRequired(onChainPaymentData, payment.InvoiceEntity.SpeedPolicy);
-		var confCount = onChainPaymentData.ConfirmationCount;
-		confCount = Math.Min(confReq, confCount);
-		m.Confirmations = $"{confCount} / {confReq}";
+		m.Confirmations = confReq == 0
+            ? "No confirmations required"
+            : $"{Math.Min(confReq, onChainPaymentData.ConfirmationCount)} / {confReq}";
 
         m.TransactionId = onChainPaymentData.TransactionId;
         m.ReceivedTime = payment.ReceivedTime;

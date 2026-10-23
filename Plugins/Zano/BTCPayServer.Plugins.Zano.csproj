@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk.Razor">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
   </PropertyGroup>
 
@@ -8,7 +8,7 @@
   <PropertyGroup>
     <Product>Zano</Product>
     <Description>This plugin extends BTCPay Server to enable users to receive payments via Zano.</Description>
-    <Version>1.0.0</Version>
+    <Version>1.2.0</Version>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
   </PropertyGroup>
 
@@ -39,7 +39,6 @@
   <!-- Deterministic build -->
   <ItemGroup>
     <PackageReference Include="DotNet.ReproducibleBuilds" Version="1.2.25" PrivateAssets="All"/>
-    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
   <!-- If you need Entity Framework, you can uncomment this. This will make it usable in your project without publishing assemblies
@@ -74,6 +73,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\submodules\btcpayserver\BTCPayServer\BTCPayServer.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="BTCPayServer.Plugins.IntegrationTests" />
+  </ItemGroup>
+
   <ItemGroup>
     <EmbeddedResource Include="zano.svg" />
   </ItemGroup>

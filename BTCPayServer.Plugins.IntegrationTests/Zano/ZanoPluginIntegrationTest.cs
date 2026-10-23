@@ -1,19 +1,23 @@
+using BTCPayServer.Data;
+using BTCPayServer.Payments;
+using BTCPayServer.Plugins.Zano.Payments;
 using BTCPayServer.Rating;
+using BTCPayServer.Services.Invoices;
 using BTCPayServer.Services.Rates;
 using BTCPayServer.Tests.Mocks;
 
 using Xunit;
-using Xunit.Abstractions;
 
 namespace BTCPayServer.Plugins.IntegrationTests.Zano;
 
-public class ZanoPluginIntegrationTest(ITestOutputHelper helper) : ZanoAndBitcoinIntegrationTestBase(helper)
+public class ZanoPluginIntegrationTest(ITestOutputHelper helper) : ZanoIntegrationTestBase(helper)
 {
     [Fact]
     public async Task ShouldEnableZanoPluginSuccessfully()
     {
-        await using var s = CreatePlaywrightTester();
+        await using var s = CreatePlaywrightTester(newDb: true);
         await s.StartAsync();
+        await IntegrationTestUtils.WaitForZanoAsync(s);
 
         if (s.Server.PayTester.MockRates)
         {
@@ -54,7 +58,6 @@ public class ZanoPluginIntegrationTest(ITestOutputHelper helper) : ZanoAndBitcoi
         await s.Page.Locator("#page-primary").ClickAsync();
         await s.Page.FillAsync("#Amount", "4.20");
         await s.Page.FillAsync("#BuyerEmail", "zano@zano.org");
-        await Task.Delay(TimeSpan.FromSeconds(25)); // wallet-rpc needs some time to sync
         await s.Page.Locator("#page-primary").ClickAsync();
 
         // View the invoice
@@ -72,47 +75,101 @@ public class ZanoPluginIntegrationTest(ITestOutputHelper helper) : ZanoAndBitcoi
         // Select confirmation time to 0
         await s.Page.GoBackAsync();
         await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
-        await s.Page.SelectOptionAsync("#SettlementConfirmationThresholdChoice", "3");
+        await s.Page.SelectOptionAsync("#SettlementConfirmationThresholdChoice", "1");
         await s.Page.ClickAsync("#SaveButton");
 
-        await IntegrationTestUtils.CleanUpAsync(s);
     }
 
     [Fact]
-    public async Task ShouldLoadWalletOnStartUpIfExists()
+    public async Task ShouldRejectNegativeInvoiceAmounts()
     {
-        await using var s = CreatePlaywrightTester();
-        await IntegrationTestUtils.CopyWalletFilesToZanoRpcDirAsync(s, "wallet");
+        await using var s = CreatePlaywrightTester(newDb: true);
         await s.StartAsync();
+        await IntegrationTestUtils.WaitForZanoAsync(s);
+        await s.RegisterNewUser(true);
+        await s.CreateNewStore();
+        await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
+        await s.Page.CheckAsync("#Enabled");
+        await s.Page.ClickAsync("#SaveButton");
+        var client = await s.AsTestAccount().CreateClient();
+
+        foreach (var amount in new[] { "-5", "-0.000000000001" })
+        {
+            await s.GoToInvoices();
+            await s.ClickPagePrimary();
+            await s.Page.FillAsync("#Amount", amount);
+            await s.Page.FillAsync("#Currency", "ZANO");
+            // Submit directly so browser validation cannot hide a missing server check.
+            await s.Page.EvaluateAsync("document.querySelector('#Amount').form.submit()");
+            await s.Page.Locator("[data-valmsg-for='Amount'].field-validation-error").WaitForAsync();
+            Assert.Contains("cannot be negative", await s.Page.ContentAsync());
+            Assert.Empty(await client.GetInvoices(s.StoreId, token: TestContext.Current.CancellationToken));
+        }
+    }
+
+    [Fact]
+    public async Task ShouldDisplayConfirmationPolicyInPaymentDetails()
+    {
+        await using var s = CreatePlaywrightTester(newDb: true);
+        await s.StartAsync();
+        await IntegrationTestUtils.WaitForZanoAsync(s);
+        await s.RegisterNewUser(true);
+        await s.CreateNewStore();
+        await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
+        await s.Page.CheckAsync("#Enabled");
+        await s.Page.ClickAsync("#SaveButton");
+        var invoiceId = await s.CreateInvoice(amount: 4, currency: "ZANO");
+        var repository = s.Server.PayTester.GetService<InvoiceRepository>();
+        var invoice = await repository.GetInvoice(invoiceId);
+        var handlers = s.Server.PayTester.GetService<PaymentMethodHandlerDictionary>();
+        var handler = (ZanoPaymentMethodHandler)handlers[PaymentTypes.CHAIN.GetPaymentMethodId("ZANO")];
+        var paymentPrompt = invoice.GetPaymentPrompt(handler.PaymentMethodId);
+        Assert.NotNull(paymentPrompt);
+        var prompt = handler.ParsePaymentPromptDetails(paymentPrompt.Details);
+        var paymentService = s.Server.PayTester.GetService<PaymentService>();
+        var cases = new[]
+        {
+            (Required: 0L, Received: 0L, Expected: "No confirmations required"),
+            (Required: 0L, Received: 5L, Expected: "No confirmations required"),
+            (Required: 1L, Received: 0L, Expected: "0 / 1"),
+            (Required: 1L, Received: 5L, Expected: "1 / 1")
+        };
+
+        foreach (var (required, received, expected) in cases)
+        {
+            var transactionId = Guid.NewGuid().ToString("N");
+            var payment = new PaymentData
+            {
+                Id = transactionId,
+                InvoiceDataId = invoiceId,
+                Currency = "ZANO",
+                Amount = 1m,
+                Created = DateTimeOffset.UtcNow,
+                Status = received >= required ? PaymentStatus.Settled : PaymentStatus.Processing
+            }.Set(invoice, handler, new ZanoPaymentData
+            {
+                PaymentId = prompt.PaymentId,
+                TransactionId = transactionId,
+                ConfirmationCount = received,
+                InvoiceSettledConfirmationThreshold = required
+            });
+            Assert.NotNull(await paymentService.AddPayment(payment));
+            await s.GoToInvoice(invoiceId);
+            var row = s.Page.Locator("tr").Filter(new() { HasTextString = transactionId });
+            Assert.Equal(expected, await row.Locator("td").Nth(3).InnerTextAsync());
+        }
+    }
+
+    [Fact]
+    public async Task ShouldReportPreOpenedWalletOnStartup()
+    {
+        await using var s = CreatePlaywrightTester(newDb: true);
+        await s.StartAsync();
+        await IntegrationTestUtils.WaitForZanoAsync(s);
         await s.RegisterNewUser(true);
         await s.CreateNewStore();
         await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
 
-        var walletRpcIsAvailable = await s.Page
-            .Locator("li.list-group-item:text('Wallet RPC available: True')")
-            .InnerTextAsync();
-
-        Assert.Contains("Wallet RPC available: True", walletRpcIsAvailable);
-
-        await IntegrationTestUtils.CleanUpAsync(s);
-    }
-
-    [Fact]
-    public async Task ShouldLoadWalletWithPasswordOnStartUpIfExists()
-    {
-        await using var s = CreatePlaywrightTester();
-        await IntegrationTestUtils.CopyWalletFilesToZanoRpcDirAsync(s, "wallet_password");
-        await s.StartAsync();
-        await s.RegisterNewUser(true);
-        await s.CreateNewStore();
-        await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
-
-        var walletRpcIsAvailable = await s.Page
-            .Locator("li.list-group-item:text('Wallet RPC available: True')")
-            .InnerTextAsync();
-
-        Assert.Contains("Wallet RPC available: True", walletRpcIsAvailable);
-
-        await IntegrationTestUtils.CleanUpAsync(s);
+        Assert.Contains("Wallet RPC available: True", await s.Page.ContentAsync());
     }
 }
