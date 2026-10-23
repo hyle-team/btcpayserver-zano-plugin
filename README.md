@@ -36,7 +36,7 @@ TICKER|asset_id|decimals|DisplayName|rate_mode|rate_param
   - `none` *(default)* — no automatic rate; configure manually in BTCPay's rate rules.
   - `pegged_usd` — `<CODE>_X = USD_X` (1:1 USD stablecoin).
   - `fixed_usd` — fixed price in USD (`rate_param` = USD price, e.g. `0.50`).
-  - `coingecko` — *(accepted but currently a no-op)* BTCPay's rate-rule parser rejects hyphenated coingecko ids; until that's worked around, this mode records the coin id but emits no default rule. Merchants must configure the rate manually in BTCPay's UI.
+  - `coingecko` — *(accepted but currently a no-op)* BTCPay no longer bundles CoinGecko. This compatibility mode records the coin id but emits no default rule. Merchants must configure a supported rate source in BTCPay's UI.
 - **`rate_param`** *(required for `fixed_usd` and `coingecko`)* — see above.
 
 ### Example
@@ -48,7 +48,7 @@ BTCPAY_ZANO_EXTRA_ASSETS=USDZ|0123...cdef|6|USD Zano|pegged_usd;;BTCZ|fedc...456
 Registers two extra payment methods in addition to native ZANO:
 
 - `ZANOUSDZ` — "USD Zano", 6 decimals, pegged 1:1 to USD.
-- `ZANOBTCZ` — "Wrapped BTC", 12 decimals, priced via CoinGecko's `wrapped-bitcoin` feed.
+- `ZANOBTCZ` — "Wrapped BTC", 12 decimals. Configure a supported rate source for it in BTCPay's UI.
 
 Each extra asset appears under **Store Settings > Zano** with its own enable/disable toggle and confirmation-threshold setting. The checkout badge shows the asset ticker, and the payment URI includes `&asset_id=…` so customer wallets can pre-select the correct asset.
 
@@ -161,7 +161,7 @@ Dependency submission is optional. Enable the repository's dependency graph, the
 - **Payment detection**: Polls `get_bulk_payments` every 15 seconds
 - **Fee**: Fixed 0.01 ZANO per transaction
 - **Divisibility**: 12 decimal places
-- **Rate source**: CoinGecko (`ZANO_BTC`)
+- **Rate source**: CoinPaprika (`ZANO_USD`). The plugin registers the provider, so USD-priced ZANO invoices work without a separate rate plugin or API key. Other fiat currencies use BTCPay's configured USD conversion rules. Stores with custom CoinGecko scripts must replace their old ZANO rules with `ZANO_USD = zanocoinpaprika(ZANO_USD)` and `ZANO_X = ZANO_USD * USD_X`.
 - **Confirmations**: Configurable (0, 1, 10, or custom)
 
 ## License

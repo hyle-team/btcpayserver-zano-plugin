@@ -1,3 +1,5 @@
+using System.Globalization;
+
 using BTCPayServer.Data;
 using BTCPayServer.Payments;
 using BTCPayServer.Plugins.Zano.Payments;
@@ -22,13 +24,13 @@ public class ZanoPluginIntegrationTest(ITestOutputHelper helper) : ZanoIntegrati
         if (s.Server.PayTester.MockRates)
         {
             var rateProviderFactory = s.Server.PayTester.GetService<RateProviderFactory>();
+            Assert.Contains(s.Server.PayTester.GetService<IEnumerable<IRateProvider>>(),
+                provider => provider.RateSourceInfo.Id == "zanocoinpaprika");
             rateProviderFactory.Providers.Clear();
 
-            var coinAverageMock = new MockRateProvider();
-            coinAverageMock.ExchangeRates.Add(new PairRate(CurrencyPair.Parse("BTC_USD"), new BidAsk(5000m)));
-            coinAverageMock.ExchangeRates.Add(new PairRate(CurrencyPair.Parse("BTC_EUR"), new BidAsk(4000m)));
-            coinAverageMock.ExchangeRates.Add(new PairRate(CurrencyPair.Parse("ZANO_BTC"), new BidAsk(4500m)));
-            rateProviderFactory.Providers.Add("coingecko", coinAverageMock);
+            var zanoRates = new MockRateProvider();
+            zanoRates.ExchangeRates.Add(new PairRate(CurrencyPair.Parse("ZANO_USD"), new BidAsk(4.2m)));
+            rateProviderFactory.Providers.Add("zanocoinpaprika", zanoRates);
 
             var kraken = new MockRateProvider();
             kraken.ExchangeRates.Add(new PairRate(CurrencyPair.Parse("BTC_USD"), new BidAsk(0.1m)));
@@ -71,6 +73,10 @@ public class ZanoPluginIntegrationTest(ITestOutputHelper helper) : ZanoIntegrati
             .Locator("#PaymentDetails-TotalFiat dd.clipboard-button")
             .InnerTextAsync();
         Assert.Equal("$4.20", totalFiat);
+        var zanoDue = await s.Page.EvaluateAsync<string>(
+            "async invoiceId => (await (await fetch(`/i/${invoiceId}/status?paymentMethodId=ZANO-CHAIN`)).json()).due",
+            invoiceId);
+        Assert.Equal(1m, decimal.Parse(zanoDue, CultureInfo.InvariantCulture));
 
         // Select confirmation time to 0
         await s.Page.GoBackAsync();
