@@ -1,39 +1,15 @@
-FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends chromium-driver \
-    && rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/dotnet/sdk:10.0.402-noble
 
 WORKDIR /source
-COPY ../submodules/btcpayserver/nuget.config nuget.config
-COPY ../submodules/btcpayserver/Build/Common.csproj Build/Common.csproj
-COPY ../submodules/btcpayserver/BTCPayServer.Abstractions/BTCPayServer.Abstractions.csproj BTCPayServer.Abstractions/BTCPayServer.Abstractions.csproj
-COPY ../submodules/btcpayserver/BTCPayServer/BTCPayServer.csproj BTCPayServer/BTCPayServer.csproj
-COPY ../submodules/btcpayserver/BTCPayServer.Common/BTCPayServer.Common.csproj BTCPayServer.Common/BTCPayServer.Common.csproj
-COPY ../submodules/btcpayserver/BTCPayServer.Rating/BTCPayServer.Rating.csproj BTCPayServer.Rating/BTCPayServer.Rating.csproj
-COPY ../submodules/btcpayserver/BTCPayServer.Data/BTCPayServer.Data.csproj BTCPayServer.Data/BTCPayServer.Data.csproj
-COPY ../submodules/btcpayserver/BTCPayServer.Client/BTCPayServer.Client.csproj BTCPayServer.Client/BTCPayServer.Client.csproj
-RUN cd BTCPayServer && dotnet restore
-COPY ../submodules/btcpayserver/BTCPayServer.Common/. BTCPayServer.Common/.
-COPY ../submodules/btcpayserver/BTCPayServer.Rating/. BTCPayServer.Rating/.
-COPY ../submodules/btcpayserver/BTCPayServer.Data/. BTCPayServer.Data/.
-COPY ../submodules/btcpayserver/BTCPayServer.Client/. BTCPayServer.Client/.
-COPY ../submodules/btcpayserver/BTCPayServer.Abstractions/. BTCPayServer.Abstractions/.
-COPY ../submodules/btcpayserver/BTCPayServer/. BTCPayServer/.
-COPY ../submodules/btcpayserver/Build/Version.csproj Build/Version.csproj
-
-ENV SCREEN_HEIGHT 600 \
-    SCREEN_WIDTH 1200
-
 COPY . .
 
 ARG CONFIGURATION_NAME=Release
-ARG MONERO_PLUGIN_FOLDER=/root/.btcpayserver/Plugins/BTCPayServer.Plugins.Zano/
-RUN mkdir -p ${MONERO_PLUGIN_FOLDER}
-RUN cd Plugins/Zano && dotnet build BTCPayServer.Plugins.Zano.sln --configuration ${CONFIGURATION_NAME} /p:RazorCompileOnBuild=true --output ${MONERO_PLUGIN_FOLDER}
-RUN cd BTCPayServer.Plugins.IntegrationTests && dotnet build --configuration ${CONFIGURATION_NAME} /p:CI_TESTS=true /p:RazorCompileOnBuild=true
-RUN dotnet tool install --global JetBrains.DotCover.CommandLineTools --version 2025.1.6
-ENV PATH="$PATH:/root/.dotnet/tools"
-RUN pwsh /source/BTCPayServer.Plugins.IntegrationTests/bin/Release/net8.0/playwright.ps1 install chromium --with-deps
+RUN dotnet restore btcpay-zano-plugin.sln \
+    && dotnet build BTCPayServer.Plugins.IntegrationTests -c ${CONFIGURATION_NAME} --no-restore \
+    && dotnet build Plugins/Zano/BTCPayServer.Plugins.Zano.csproj -c ${CONFIGURATION_NAME} --no-restore \
+       --output /root/.btcpayserver/Plugins/BTCPayServer.Plugins.Zano
+RUN pwsh BTCPayServer.Plugins.IntegrationTests/bin/${CONFIGURATION_NAME}/net10.0/playwright.ps1 install chromium --with-deps
+
 WORKDIR /source/BTCPayServer.Plugins.IntegrationTests
 ENV CONFIGURATION_NAME=${CONFIGURATION_NAME}
 ENTRYPOINT ["./docker-entrypoint.sh"]

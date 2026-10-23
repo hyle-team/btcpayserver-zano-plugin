@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- Patch the pinned 2.4.5 host without modifying the upstream submodule. -->
+  <ItemGroup Condition="'$(MSBuildProjectName)' == 'BTCPayServer' and '$(Version)' == '2.4.5'">
+    <PackageReference Update="Microsoft.AspNetCore.SignalR.Protocols.NewtonsoftJson" Version="10.0.13" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
+  </ItemGroup>
+</Project>

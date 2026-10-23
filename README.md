@@ -125,7 +125,7 @@ docker run -d --name zano_wallet \
 
 ### Requirements
 
-- .NET 8.0 SDK
+- .NET SDK 10.0.402 or later (BTCPay Server 2.4.5 or later)
 - Git
 - Docker and Docker Compose
 
@@ -137,10 +137,12 @@ cd btcpayserver-zano-plugin
 dotnet build btcpay-zano-plugin.sln
 ```
 
+`Directory.Build.targets` applies the SignalR and PKCS security patches to the pinned 2.4.5 host during development and tests. Production hosts need these patches too; installing the plugin does not replace BTCPay Server dependencies.
+
 ### Run unit tests
 
 ```bash
-dotnet test BTCPayServer.Plugins.UnitTests
+dotnet test --project BTCPayServer.Plugins.UnitTests/BTCPayServer.Plugins.UnitTests.csproj
 ```
 
 ### Run integration tests
@@ -149,26 +151,9 @@ dotnet test BTCPayServer.Plugins.UnitTests
 docker compose -f BTCPayServer.Plugins.IntegrationTests/docker-compose.yml run tests
 ```
 
-### Local development
+The integration suite runs PostgreSQL and a pre-opened Zano wallet on a private Docker network. It connects to the public testnet daemon and requires that daemon to be available.
 
-Start the dev dependencies:
-
-```bash
-cd BTCPayServer.Plugins.IntegrationTests/
-docker compose up -d dev
-```
-
-Create `appsettings.dev.json` in `btcpayserver/BTCPayServer`:
-
-```json
-{
-  "DEBUG_PLUGINS": "../../Plugins/Zano/bin/Debug/net8.0/BTCPayServer.Plugins.Zano.dll",
-  "ZANO_DAEMON_URI": "http://127.0.0.1:11211",
-  "ZANO_WALLET_DAEMON_URI": "http://127.0.0.1:11212"
-}
-```
-
-Then run BTCPay Server with the plugin loaded.
+Dependency submission is optional. Enable the repository's dependency graph, then set the Actions variable `DEPENDENCY_SUBMISSION_ENABLED=true` to run that workflow.
 
 ## Technical details
 
