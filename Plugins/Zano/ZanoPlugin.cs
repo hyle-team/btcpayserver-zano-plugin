@@ -54,8 +54,8 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
             Divisibility = ZanoAssets.NativeDecimals,
             DefaultRateRules = new[]
             {
-                    "ZANO_X = ZANO_BTC * BTC_X",
-                    "ZANO_BTC = coingecko(ZANO_BTC)"
+                    "ZANO_USD = zanocoinpaprika(ZANO_USD)",
+                    "ZANO_X = ZANO_USD * USD_X"
                 },
             CryptoImagePath = "zano.svg",
             UriScheme = "zano",
@@ -64,6 +64,7 @@ public class ZanoPlugin : BaseBTCPayServerPlugin
             IsNative = true
         };
 
+        services.AddRateProvider<ZanoCoinPaprikaRateProvider>();
         RegisterNetwork(services, nativeNetwork, blockExplorerLink);
 
         // Register ZANO + each configured CA in BTCPay's CurrencyNameTable so they appear
