@@ -108,7 +108,6 @@ namespace BTCPayServer.Plugins.Zano.Controllers
         }
 
         [HttpPost("{cryptoCode}")]
-        [DisableRequestSizeLimit]
         public async Task<IActionResult> GetStoreZanoPaymentMethod(ZanoPaymentMethodViewModel viewModel, string cryptoCode)
         {
             cryptoCode = cryptoCode.ToUpperInvariant();
@@ -153,7 +152,9 @@ namespace BTCPayServer.Plugins.Zano.Controllers
             blob.SetExcluded(PaymentTypes.CHAIN.GetPaymentMethodId(cryptoCode), !viewModel.Enabled);
             storeData.SetStoreBlob(blob);
             await _storeRepository.UpdateStore(storeData);
-            return RedirectToAction("GetStoreZanoPaymentMethod", new { cryptoCode });
+            return viewModel.Enabled
+                ? RedirectToAction(nameof(GetStoreZanoPaymentMethod), new { cryptoCode })
+                : RedirectToAction(nameof(StoreZanoAssets), new { storeId = storeData.Id });
         }
 
         // The whitelist is the SetExcluded blob inverted: a CA is "whitelisted" for a
@@ -200,7 +201,7 @@ namespace BTCPayServer.Plugins.Zano.Controllers
             }
 
             TempData["StatusMessage"] = "Zano asset whitelist updated.";
-            return RedirectToAction(nameof(StoreZanoAssets));
+            return RedirectToAction(nameof(StoreZanoAssets), new { storeId = storeData.Id });
         }
 
         private StoreZanoAssetsViewModel BuildAssetsViewModel(StoreData storeData)

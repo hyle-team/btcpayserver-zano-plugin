@@ -55,11 +55,9 @@ namespace BTCPayServer.Plugins.Zano.Services
         // confirmations be counted off the daemon's higher height.
         private const long MaxWalletBehindBlocks = 5;
 
-        private bool IsAvailable(ZanoSummary summary)
+        internal static bool IsAvailable(ZanoSummary summary)
         {
-            return summary.Synced &&
-                   summary.WalletAvailable &&
-                   summary.WalletHeight > 0 &&
+            return summary is { Synced: true, WalletAvailable: true, WalletHeight: > 0 } &&
                    summary.WalletHeight >= summary.CurrentHeight - MaxWalletBehindBlocks;
         }
 

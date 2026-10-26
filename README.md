@@ -7,7 +7,7 @@ Accept [Zano](https://zano.org) payments in BTCPay Server. Privacy-focused crypt
 
 ## How it works
 
-When a customer creates an invoice, the plugin generates a unique **integrated address** (containing an embedded payment ID) for each payment. A background poller checks the wallet every 15 seconds for incoming payments matching pending invoices, tracks confirmations, and settles invoices based on your configured threshold.
+When a customer creates an invoice, the plugin generates a unique **integrated address** (containing an embedded payment ID) for each payment. A background poller checks the wallet every 15 seconds for matching incoming payments and tracks confirmations. BTCPay Server updates invoice status using those payment states and your configured threshold.
 
 ## Configuration
 
@@ -158,8 +158,8 @@ Dependency submission is optional. Enable the repository's dependency graph, the
 ## Technical details
 
 - **Address generation**: Integrated addresses with random 8-byte payment IDs (unique per invoice)
-- **Payment detection**: Polls `get_bulk_payments` every 15 seconds
-- **Fee**: Fixed 0.01 ZANO per transaction
+- **Payment detection**: Polls `get_recent_txs_and_info2` every 15 seconds; targeted RPC lookups support reconciliation
+- **Fee**: The sender wallet pays the network fee separately; the plugin adds no payment-method fee
 - **Divisibility**: 12 decimal places
 - **Rate source**: CoinPaprika (`ZANO_USD`). The plugin registers the provider, so USD-priced ZANO invoices work without a separate rate plugin or API key. Other fiat currencies use BTCPay's configured USD conversion rules. Stores with custom CoinGecko scripts must replace their old ZANO rules with `ZANO_USD = zanocoinpaprika(ZANO_USD)` and `ZANO_X = ZANO_USD * USD_X`.
 - **Confirmations**: Configurable (0, 1, 10, or custom)

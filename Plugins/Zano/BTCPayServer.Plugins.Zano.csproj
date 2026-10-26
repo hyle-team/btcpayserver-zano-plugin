@@ -8,7 +8,7 @@
   <PropertyGroup>
     <Product>Zano</Product>
     <Description>This plugin extends BTCPay Server to enable users to receive payments via Zano.</Description>
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
   </PropertyGroup>
 

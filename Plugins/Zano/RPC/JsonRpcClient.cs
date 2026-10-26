@@ -32,6 +32,8 @@ namespace BTCPayServer.Plugins.Zano.RPC
         {
             "getinfo",
             "get_wallet_info",
+            // Deterministic wallet-side address formatting needs no history scan.
+            "make_integrated_address",
             // Point lookup of a single tx — answers in milliseconds on a healthy
             // daemon. The default 30s budget let one wedged daemon consume up to
             // ~90s (with retries) per probed payment inside the wallet-scan lock.

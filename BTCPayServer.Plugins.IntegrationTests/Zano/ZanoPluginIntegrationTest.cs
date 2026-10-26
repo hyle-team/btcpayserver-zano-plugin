@@ -87,30 +87,54 @@ public class ZanoPluginIntegrationTest(ITestOutputHelper helper) : ZanoIntegrati
     }
 
     [Fact]
-    public async Task ShouldRejectNegativeInvoiceAmounts()
+    public async Task ShouldReturnToAssetsAfterDisablingPaymentMethod()
     {
         await using var s = CreatePlaywrightTester(newDb: true);
         await s.StartAsync();
         await IntegrationTestUtils.WaitForZanoAsync(s);
         await s.RegisterNewUser(true);
-        await s.CreateNewStore();
+        await s.CreateNewStore(preferredExchange: "Kraken");
         await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
         await s.Page.CheckAsync("#Enabled");
         await s.Page.ClickAsync("#SaveButton");
-        var client = await s.AsTestAccount().CreateClient();
 
-        foreach (var amount in new[] { "-5", "-0.000000000001" })
-        {
-            await s.GoToInvoices();
-            await s.ClickPagePrimary();
-            await s.Page.FillAsync("#Amount", amount);
-            await s.Page.FillAsync("#Currency", "ZANO");
-            // Submit directly so browser validation cannot hide a missing server check.
-            await s.Page.EvaluateAsync("document.querySelector('#Amount').form.submit()");
-            await s.Page.Locator("[data-valmsg-for='Amount'].field-validation-error").WaitForAsync();
-            Assert.Contains("cannot be negative", await s.Page.ContentAsync());
-            Assert.Empty(await client.GetInvoices(s.StoreId, token: TestContext.Current.CancellationToken));
-        }
+        await s.Page.UncheckAsync("#Enabled");
+        await s.Page.ClickAsync("#SaveButton");
+
+        Assert.EndsWith($"/stores/{s.StoreId}/zano/assets", s.Page.Url);
+        var enabled = s.Page.Locator("input[name='WhitelistedCryptoCodes'][value='ZANO']");
+        Assert.False(await enabled.IsCheckedAsync());
+        await enabled.CheckAsync();
+        await s.Page.ClickAsync("#SaveAssetWhitelist");
+        await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
+        Assert.True(await s.Page.IsCheckedAsync("#Enabled"));
+    }
+
+    [Fact]
+    public async Task ShouldLeaveSharedInvoiceAmountPolicyToCore()
+    {
+        await using var s = CreatePlaywrightTester(newDb: true);
+        await s.StartAsync();
+        await IntegrationTestUtils.WaitForZanoAsync(s);
+        await s.RegisterNewUser(true);
+        await s.CreateNewStore(preferredExchange: "Kraken");
+        await s.Page.Locator("a.nav-link[href*='zano/ZANO']").ClickAsync();
+        await s.Page.CheckAsync("#Enabled");
+        await s.Page.ClickAsync("#SaveButton");
+        var stores = s.Server.PayTester.StoreRepository;
+        var store = await stores.FindStore(s.StoreId);
+        Assert.NotNull(store);
+        var settings = store.GetStoreBlob();
+        settings.AllowZeroAmountInvoices = true;
+        store.SetStoreBlob(settings);
+        await stores.UpdateStore(store);
+
+        var id = await s.CreateInvoice(amount: -5, currency: "USD");
+        var invoice = await s.Server.PayTester.InvoiceRepository.GetInvoice(id);
+        Assert.NotNull(invoice);
+
+        Assert.Equal(0m, invoice.Price);
+        Assert.Empty(invoice.GetPaymentPrompts());
     }
 
     [Fact]

@@ -18,20 +18,9 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         public bool AllAvailable()
         {
-            // Match ZanoRpcProvider.IsAvailable: a network is ready only when its summary
-            // exists, the daemon reports synced (DaemonNetworkState == 2 sets Synced=true),
-            // and the wallet RPC is reachable. Empty Summaries means nothing has been
-            // polled yet — report unavailable so /api/v1/server/info doesn't claim
-            // fullySynched=true during plugin startup or when no Zano network is configured.
-            var configured = _zanoRpcProvider.DaemonRpcClients;
-            if (configured.Count == 0)
-            {
-                return false;
-            }
-            return configured.Keys.All(code =>
-                _zanoRpcProvider.Summaries.TryGetValue(code, out var s)
-                && s.Synced
-                && s.WalletAvailable);
+            // No configured Zano networks impose no sync requirement on the host.
+            // Configured networks must use the same readiness check as payment handling.
+            return _zanoRpcProvider.DaemonRpcClients.Keys.All(_zanoRpcProvider.IsAvailable);
         }
 
         public string Partial { get; } = "/Views/Zano/ZanoSyncSummary.cshtml";
@@ -54,7 +43,7 @@ namespace BTCPayServer.Plugins.Zano.Services
         {
             get
             {
-                return Summary?.WalletAvailable ?? false;
+                return ZanoRpcProvider.IsAvailable(Summary);
             }
         }
 

@@ -15,7 +15,6 @@ using BTCPayServer.Plugins.Zano.Payments;
 using BTCPayServer.Plugins.Zano.RPC;
 using BTCPayServer.Plugins.Zano.RPC.Models;
 using BTCPayServer.Plugins.Zano.Utils;
-using BTCPayServer.Services;
 using BTCPayServer.Services.Invoices;
 using BTCPayServer.Services.Notifications;
 
@@ -35,16 +34,11 @@ namespace BTCPayServer.Plugins.Zano.Services
         private readonly BTCPayNetworkProvider _networkProvider;
         private readonly ILogger<ZanoListener> _logger;
         private readonly PaymentMethodHandlerDictionary _handlers;
-        private readonly InvoiceActivator _invoiceActivator;
         private readonly PaymentService _paymentService;
         private readonly NotificationSender _notificationSender;
 
-        // One SemaphoreSlim(1,1) per wallet URI group, lazy-initialized on first use.
-        // Serializes UpdateAllPaymentStatesForWalletGroupAsync so the regular poll
-        // (ZanoWalletPollEvent) and availability-triggered scans (ZanoDaemonStateChange)
-        // never overlap against the same wallet — duplicate scans cost RPC, race on the
-        // shared updatedPaymentEntities list, and the old fire-and-forget on state
-        // change dropped exceptions outside the inner RPC catch.
+        // Keep the wallet scan boundary explicit for any future callers. The current
+        // EventHostedServiceBase loop already awaits and serializes both event paths.
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _walletScanSemaphores = new(StringComparer.Ordinal);
 
         // Resolved once from ZanoConfiguration.GroupByWallet(). Maps a single crypto
@@ -59,7 +53,6 @@ namespace BTCPayServer.Plugins.Zano.Services
             BTCPayNetworkProvider networkProvider,
             ILogger<ZanoListener> logger,
             PaymentMethodHandlerDictionary handlers,
-            InvoiceActivator invoiceActivator,
             PaymentService paymentService,
             NotificationSender notificationSender) : base(eventAggregator, logger)
         {
@@ -70,7 +63,6 @@ namespace BTCPayServer.Plugins.Zano.Services
             _networkProvider = networkProvider;
             _logger = logger;
             _handlers = handlers;
-            _invoiceActivator = invoiceActivator;
             _paymentService = paymentService;
             _notificationSender = notificationSender;
 
@@ -102,10 +94,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     _logger.LogInformation("{CryptoCode} just became available", stateChange.CryptoCode);
                     if (_walletGroupByCryptoCode.TryGetValue(stateChange.CryptoCode, out var group))
                     {
-                        // Awaited (was fire-and-forget): exceptions are observable
-                        // via base ProcessEvent, and the per-wallet semaphore inside
-                        // UpdateAllPaymentStatesForWalletGroupAsync prevents overlap
-                        // with the regular ZanoWalletPollEvent scan.
+                        // Await so errors and cancellation flow through the core event loop.
                         await UpdateAllPaymentStatesForWalletGroupAsync(group, cancellationToken);
                     }
                 }
@@ -121,23 +110,13 @@ namespace BTCPayServer.Plugins.Zano.Services
             }
         }
 
-        private async Task ReceivedPayment(InvoiceEntity invoice, PaymentEntity payment)
+        private void ReceivedPayment(PaymentEntity payment)
         {
+            // AddPayment returns a payment attached to the freshly loaded full invoice.
+            var invoice = payment.InvoiceEntity;
             _logger.LogInformation(
                 "Invoice {InvoiceId} received payment {Value} {Currency} {PaymentId}",
                 invoice.Id, payment.Value, payment.Currency, payment.Id);
-
-            var prompt = invoice.GetPaymentPrompt(payment.PaymentMethodId);
-
-            if (prompt != null &&
-                prompt.Activated &&
-                prompt.Destination == payment.Destination &&
-                prompt.Calculate().Due > 0.0m)
-            {
-                await _invoiceActivator.ActivateInvoicePaymentMethod(invoice.Id, payment.PaymentMethodId, true);
-                invoice = await _invoiceRepository.GetInvoice(invoice.Id);
-            }
-
             _eventAggregator.Publish(
                 new InvoiceEvent(invoice, InvoiceEvent.ReceivedPayment) { Payment = payment });
         }
@@ -215,7 +194,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                 var matchedByCrypto = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
                 foreach (var ctx in perCrypto)
                 {
-                    matchedByCrypto[ctx.CryptoCode] = await ProcessTransfersForCryptoAsync(ctx, allTransfers);
+                    matchedByCrypto[ctx.CryptoCode] = await ProcessTransfersForCryptoAsync(ctx, allTransfers, cancellationToken);
                 }
 
                 using var probeBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -230,14 +209,9 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         // Collect all payment_ids from pending invoices for a single crypto code.
         //
-        // For each invoice we collect both the CURRENT prompt's payment_id AND the
-        // payment_ids of every Zano payment already recorded against the invoice.
-        // BTCPay re-activates the payment prompt (regenerating address + pid) after
-        // a payment is registered while Due is still being recomputed against the
-        // pre-AddPayment invoice snapshot. Without history, every subsequent poll
-        // would key off the new prompt pid and never re-match the already-recorded
-        // payment — its confirmations would stall at the value seen at first detection
-        // and the invoice would never reach Settled.
+        // Keep the current prompt ID and IDs already recorded on the invoice. Earlier
+        // plugin versions rotated the prompt after a receipt, so pending confirmations
+        // and later transfers to those historical addresses must still be matched.
         private CryptoScanContext BuildExpandedInvoicesForCrypto(string cryptoCode, InvoiceEntity[] invoices)
         {
             var network = (ZanoSpecificBtcPayNetwork)_networkProvider.GetNetwork(cryptoCode);
@@ -411,7 +385,7 @@ namespace BTCPayServer.Plugins.Zano.Services
         // which recorded payments were NOT seen.
         private async Task<HashSet<string>> ProcessTransfersForCryptoAsync(
             CryptoScanContext ctx,
-            List<ZanoTransfer> allTransfers)
+            List<ZanoTransfer> allTransfers, CancellationToken cancellationToken)
         {
             long currentHeight = 0;
             if (_zanoRpcProvider.Summaries.TryGetValue(ctx.CryptoCode, out var summary))
@@ -504,7 +478,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                     cand.UnlockTime,
                     cand.AssetId,
                     matchingInvoice.Invoice,
-                    updatedPaymentEntities);
+                    updatedPaymentEntities, cancellationToken);
             }
 
             if (updatedPaymentEntities.Any())
@@ -1388,10 +1362,11 @@ namespace BTCPayServer.Plugins.Zano.Services
 
         // Called sequentially per candidate (see the caller). Appends to the shared
         // update list; alerts are recorded in the payment row and delivered after commit.
-        private async Task HandlePaymentData(string cryptoCode, decimal totalAmount, string paymentId,
+        internal async Task HandlePaymentData(string cryptoCode, decimal totalAmount, string paymentId,
             string txId, long confirmations, long blockHeight, long locktime, string assetId, InvoiceEntity invoice,
-            List<(PaymentEntity Payment, InvoiceEntity invoice)> paymentsToUpdate)
+            List<(PaymentEntity Payment, InvoiceEntity invoice)> paymentsToUpdate, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var network = _networkProvider.GetNetwork(cryptoCode);
             var pmi = PaymentTypes.CHAIN.GetPaymentMethodId(network.CryptoCode);
             var handler = (ZanoPaymentMethodHandler)_handlers[pmi];
@@ -1412,22 +1387,48 @@ namespace BTCPayServer.Plugins.Zano.Services
                 details.SettledAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                 details.ReconciliationActive = true;
             }
-            var paymentData = new PaymentData()
-            {
-                Status = status,
-                Amount = ZanoMoney.FromAtomic(totalAmount, network.Divisibility),
-                Created = DateTimeOffset.UtcNow,
-                Id = $"{txId}#{paymentId}",
-                Currency = network.CryptoCode,
-                InvoiceDataId = invoice.Id,
-            }.Set(invoice, handler, details);
-
-            // Check if this tx exists as a payment to this invoice already
+            var id = $"{txId}#{paymentId}";
             var alreadyExistingPayment = GetAllZanoPayments(invoice, cryptoCode)
-                .SingleOrDefault(c => c.Id == paymentData.Id && c.PaymentMethodId == pmi);
+                .SingleOrDefault(c => c.Id == id && c.PaymentMethodId == pmi);
 
             if (alreadyExistingPayment == null)
             {
+                var paymentData = new PaymentData()
+                {
+                    Status = status,
+                    Amount = ZanoMoney.FromAtomic(totalAmount, network.Divisibility),
+                    Created = DateTimeOffset.UtcNow,
+                    Id = id,
+                    Currency = network.CryptoCode,
+                    InvoiceDataId = invoice.Id,
+                }.Set(invoice, handler, details);
+                if (!string.Equals(paymentId, promptDetails.PaymentId, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Core's Set helper copies the current prompt. Reconstruct a historical
+                    // destination from its matched ID rather than trusting legacy row metadata.
+                    MakeIntegratedAddressResponse address;
+                    try
+                    {
+                        address = await _zanoRpcProvider.WalletRpcClients[cryptoCode]
+                            .SendCommandAsync<MakeIntegratedAddressRequest, MakeIntegratedAddressResponse>(
+                                "make_integrated_address", new MakeIntegratedAddressRequest { PaymentId = paymentId }, cancellationToken);
+                        if (string.IsNullOrWhiteSpace(address?.IntegratedAddress))
+                        {
+                            throw new InvalidOperationException("Wallet returned no integrated address for the historical payment ID.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        _logger.LogWarning("Deferring historical receipt {Tx} for invoice {InvoiceId}: destination lookup failed ({ErrorType})",
+                            txId, invoice.Id, ex.GetType().Name);
+                        return;
+                    }
+                    var blob = paymentData.GetBlob();
+                    blob.Destination = address.IntegratedAddress;
+                    paymentData.SetBlob(pmi, blob);
+                }
+
                 // Funds that actually arrived are recorded even on a settled invoice
                 // (late first observation, overpayment, replacement send): the row is
                 // idempotent by id, so this fires once per transaction, and BTCPay's
@@ -1442,7 +1443,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                 var payment = await _paymentService.AddPayment(paymentData, [txId]);
                 if (payment != null)
                 {
-                    await ReceivedPayment(invoice, payment);
+                    ReceivedPayment(payment);
                 }
             }
             else
