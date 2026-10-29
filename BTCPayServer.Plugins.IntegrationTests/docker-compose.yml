@@ -29,9 +29,9 @@ services:
       - |
         if [ ! -f /wallet/wallet ]; then
           # The interactive exit command returns 1 even after generating the wallet.
-          echo exit | simplewallet --generate-new-wallet=/wallet/wallet --password=pass --daemon-address=37.27.100.59:10505 >/dev/null 2>&1 || test -s /wallet/wallet
+          echo exit | simplewallet --generate-new-wallet=/wallet/wallet --password=btcpay-test-wallet --daemon-address=37.27.100.59:10505 >/dev/null 2>&1 || test -s /wallet/wallet
         fi
-        exec simplewallet --wallet-file=/wallet/wallet --password=pass --daemon-address=37.27.100.59:10505 --rpc-bind-ip=0.0.0.0 --rpc-bind-port=11212 --unsecure-no-auth
+        exec simplewallet --wallet-file=/wallet/wallet --password=btcpay-test-wallet --daemon-address=37.27.100.59:10505 --rpc-bind-ip=0.0.0.0 --rpc-bind-port=11212 --unsecure-no-auth
     healthcheck:
       test:
         - CMD-SHELL
