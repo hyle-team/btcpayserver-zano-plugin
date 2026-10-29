@@ -179,7 +179,7 @@ public class ZanoReceiptTests(ITestOutputHelper helper) : ZanoIntegrationTestBas
     private static ZanoPaymentMethodHandler Handler(PlaywrightTester s) =>
         (ZanoPaymentMethodHandler)s.Server.PayTester.GetService<PaymentMethodHandlerDictionary>()[PaymentTypes.CHAIN.GetPaymentMethodId("ZANO")];
 
-    private static async Task<ZanoListener> StartAsync(PlaywrightTester s)
+    internal static async Task<ZanoListener> StartAsync(PlaywrightTester s)
     {
         await s.StartAsync();
         await IntegrationTestUtils.WaitForZanoAsync(s);

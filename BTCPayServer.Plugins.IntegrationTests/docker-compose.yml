@@ -22,7 +22,7 @@ services:
       - ../coverage:/coverage
 
   zano_wallet:
-    image: pavelravaga/zano:2.2.1.502@sha256:5b2c8fbb7f5482b281318d264f7d887ca14400d4bd74cb7a7bcf3036aa443b37
+    image: pavelravaga/zano:testnet-wallet-2.2.3.605-833eac6@sha256:049f4577cc5984e84f441fb5ea648a854062ff3271c0e979ac6a9a05a9b7f615
     entrypoint: /bin/bash
     command:
       - -ec

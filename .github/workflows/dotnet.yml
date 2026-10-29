@@ -10,6 +10,30 @@ on:
   workflow_dispatch:
 
 jobs:
+  plugin-builder:
+    name: Plugin Builder SDK compatibility
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/dotnet/sdk:10.0.400-noble
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Verify the Plugin Builder SDK
+        run: test "$(dotnet --version)" = "10.0.400"
+      - name: Publish with the Plugin Builder SDK
+        run: dotnet publish Plugins/Zano/BTCPayServer.Plugins.Zano.csproj -c Release -o plugin-artifacts -p:ContinuousIntegrationBuild=true
+      - name: Check the plugin output boundary
+        run: |
+          test -f plugin-artifacts/BTCPayServer.Plugins.Zano.dll
+          test ! -f plugin-artifacts/BTCPayServer.dll
+          test ! -f plugin-artifacts/NBitcoin.dll
+      - name: Run unit tests with the Plugin Builder SDK
+        run: dotnet test --project BTCPayServer.Plugins.UnitTests/BTCPayServer.Plugins.UnitTests.csproj -c Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-builder-sdk400
+          path: plugin-artifacts
+
   build:
     runs-on: ubuntu-latest
     steps:

@@ -129,7 +129,7 @@ namespace BTCPayServer.Plugins.Zano.Services
         // Before this consolidation, each registered network ran its own poll loop and
         // its own scan, so N CAs sharing a wallet meant N+1× the necessary load on
         // get_recent_txs_and_info2. Now the fetch happens once per wallet per tick.
-        private async Task UpdateAllPaymentStatesForWalletGroupAsync(
+        internal async Task UpdateAllPaymentStatesForWalletGroupAsync(
             ZanoWalletGroup walletGroup,
             CancellationToken cancellationToken)
         {
@@ -140,7 +140,6 @@ namespace BTCPayServer.Plugins.Zano.Services
                 // Gather pending invoices per crypto. Skip cryptos that are unavailable
                 // (their daemon hasn't reported synced) or that have no pending invoices.
                 var perCrypto = new List<CryptoScanContext>();
-                var allPaymentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 JsonRpcClient walletRpcClient = null;
                 string walletClientCryptoCode = null;
 
@@ -170,21 +169,17 @@ namespace BTCPayServer.Plugins.Zano.Services
                         continue;
                     }
                     perCrypto.Add(ctx);
-                    foreach (var pid in ctx.PaymentIds)
-                    {
-                        allPaymentIds.Add(pid);
-                    }
                     walletRpcClient ??= _zanoRpcProvider.WalletRpcClients[cryptoCode];
                     walletClientCryptoCode ??= cryptoCode;
                 }
 
-                if (allPaymentIds.Count == 0 || walletRpcClient is null)
+                if (perCrypto.Count == 0 || walletRpcClient is null)
                 {
                     return;
                 }
 
                 var (allTransfers, _) = await FetchWalletTransfersAsync(
-                    walletRpcClient, walletClientCryptoCode, allPaymentIds, cancellationToken);
+                    walletRpcClient, walletClientCryptoCode, cancellationToken);
 
                 // ONE reconciliation deadline for the whole wallet group. Probes run
                 // while this wallet's scan lock is held, so their total wall-clock —
@@ -262,9 +257,9 @@ namespace BTCPayServer.Plugins.Zano.Services
         // (payment_id, asset_id) and read the correct atomic amount for both
         // native and CA payments uniformly.
         //
-        // We page until either every monitored payment_id has been matched, the
-        // wallet history is exhausted (page returns < PageSize transfers), or a
-        // safety cap is hit. Without paging, a busy wallet (one shared between
+        // Scan until history is exhausted or the safety cap is reached. One payment ID
+        // can have several receipts, including wrong-asset transfers, so seeing it once
+        // cannot establish that all its payments were fetched. A busy wallet (shared by
         // native ZANO and many CAs) could push a valid invoice payment past the
         // first page within minutes and the listener would never see it.
         //
@@ -272,21 +267,19 @@ namespace BTCPayServer.Plugins.Zano.Services
         // the group we asked through, a single call here serves every network in
         // the wallet group — the per-network filtering happens afterwards.
         // Returns the wallet transfer rows plus whether the scan was COMPLETE. Complete means
-        // it ended by locating every monitored payment id or by exhausting the wallet history
+        // it exhausted the wallet history
         // — i.e. absence of a payment from the result is trustworthy. Incomplete means it hit
         // the page cap or an RPC error, so absence proves nothing and must NOT feed
         // drop-detection. Caller cancellation propagates rather than masquerading as an
         // empty/partial history.
-        private async Task<(List<ZanoTransfer> Transfers, bool Complete)> FetchWalletTransfersAsync(
+        internal async Task<(List<ZanoTransfer> Transfers, bool Complete)> FetchWalletTransfersAsync(
             JsonRpcClient walletRpcClient,
             string logCryptoCode,
-            HashSet<string> paymentIdSet,
             CancellationToken cancellationToken)
         {
             const int PageSize = 200;
             const int MaxPages = 10;
             var allTransfers = new List<ZanoTransfer>();
-            var matchedPaymentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int offset = 0;
             bool complete = false;
             for (int page = 0; page < MaxPages; page++)
@@ -328,26 +321,6 @@ namespace BTCPayServer.Plugins.Zano.Services
 
                 allTransfers.AddRange(result.Transfers);
 
-                foreach (var tx in result.Transfers)
-                {
-                    if (tx.SubtransfersByPid == null)
-                    {
-                        continue;
-                    }
-                    foreach (var group in tx.SubtransfersByPid)
-                    {
-                        if (!string.IsNullOrEmpty(group.PaymentId) && paymentIdSet.Contains(group.PaymentId))
-                        {
-                            matchedPaymentIds.Add(group.PaymentId);
-                        }
-                    }
-                }
-
-                if (matchedPaymentIds.Count >= paymentIdSet.Count)
-                {
-                    complete = true; // every monitored payment id located
-                    break;
-                }
                 if (result.Transfers.Count < PageSize)
                 {
                     complete = true; // history exhausted
@@ -355,7 +328,7 @@ namespace BTCPayServer.Plugins.Zano.Services
                 }
                 offset += PageSize;
                 // Falling out of the loop via MaxPages leaves complete=false: the history is
-                // deeper than our cap and some monitored payment id is still unseen.
+                // deeper than our cap, so this pass has not fetched its complete history.
             }
 
             return (DedupTransferRows(allTransfers), complete);
@@ -574,13 +547,6 @@ namespace BTCPayServer.Plugins.Zano.Services
                     continue;
                 }
 
-                // Unconfirmed payments are never probed: absence is ordinary mempool
-                // churn and no action would be taken either way.
-                if (existing.Status == PaymentStatus.Processing)
-                {
-                    continue;
-                }
-
                 // One inconclusive probe (transport failure, wedged endpoint, malformed
                 // reply) means the endpoint can't be trusted for the rest of this pass.
                 // Skipping the remaining probes is free — an inconclusive result changes
@@ -600,13 +566,36 @@ namespace BTCPayServer.Plugins.Zano.Services
                 // Cached positives are not trusted in the tail of the reconciliation
                 // window (a drop right after a cache fill there could ride cached
                 // "exists" answers until the invoice ages out) and never for recovery
-                // decisions, which need the daemon's real chain placement.
-                var allowCache = existing.Status != PaymentStatus.Unaccounted
+                // or confirmation refresh, which need the daemon's real placement.
+                var allowCache = existing.Status == PaymentStatus.Settled
                                  && !IsInReconciliationTail(existingDetails, existing.ReceivedTime, now);
                 var probe = await ProbeDaemonAsync(ctx.CryptoCode, existingDetails.TransactionId, allowCache, probeToken, cancellationToken);
                 if (probe.Exists is null)
                 {
                     probeCircuitOpen = true;
+                    continue;
+                }
+
+                if (existing.Status == PaymentStatus.Processing)
+                {
+                    // A recorded receipt can fall outside the bounded history scan.
+                    // Only fresh, explicit placement can advance it. Absence or unknown
+                    // placement never changes a Processing payment or its loss counters.
+                    if (probe.Exists is true && probe.KeeperBlock is >= -1)
+                    {
+                        ApplyRecoveredPlacement(existingDetails, probe.KeeperBlock, currentHeight);
+                        existing.Status = GetStatus(existingDetails, invoice.SpeedPolicy)
+                            ? PaymentStatus.Settled
+                            : PaymentStatus.Processing;
+                        if (existing.Status == PaymentStatus.Settled)
+                        {
+                            existingDetails.SettledAt ??= now.ToUnixTimeSeconds();
+                        }
+                        existingDetails.MissingPollCount = 0;
+                        RefreshReconciliationActive(existingDetails, existing.Status, existing.ReceivedTime, now);
+                        existing.Details = JToken.FromObject(existingDetails, ctx.Handler.Serializer);
+                        updated.Add((existing, invoice));
+                    }
                     continue;
                 }
 
@@ -1154,8 +1143,8 @@ namespace BTCPayServer.Plugins.Zano.Services
                 && DateTimeOffset.UtcNow - seenAt < DaemonHitCacheTtl)
             {
                 // Cache only answers "exists"; placement is unknown from cache. The
-                // recovery path (the only consumer of KeeperBlock) passes
-                // allowCache=false, so it always sees a real answer.
+                // recovery and confirmation-refresh paths pass allowCache=false
+                // because both require fresh chain placement.
                 return new DaemonProbeResult(true, null);
             }
 

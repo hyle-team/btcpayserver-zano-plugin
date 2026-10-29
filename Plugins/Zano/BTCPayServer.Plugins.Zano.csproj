@@ -75,6 +75,7 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="BTCPayServer.Plugins.IntegrationTests" />
+    <InternalsVisibleTo Include="BTCPayServer.Plugins.UnitTests" />
   </ItemGroup>
 
   <ItemGroup>

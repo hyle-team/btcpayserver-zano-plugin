@@ -63,7 +63,7 @@ Each extra asset appears under **Store Settings > Zano** with its own enable/dis
 ### 1. Run Zano daemon
 
 ```bash
-zanod --rpc-bind-ip=0.0.0.0 --rpc-bind-port=11211
+zanod --rpc-bind-ip=127.0.0.1 --rpc-bind-port=11211
 ```
 
 ### 2. Run Zano wallet in RPC mode
@@ -74,7 +74,7 @@ Create or open a wallet, then start simplewallet with RPC enabled:
 simplewallet --wallet-file /path/to/wallet \
   --password "your-password" \
   --daemon-address 127.0.0.1:11211 \
-  --rpc-bind-port 11212
+  --rpc-bind-ip 127.0.0.1 --rpc-bind-port 11212 --unsecure-no-auth
 ```
 
 For receive-only setups, create a watch-only wallet first:
@@ -95,37 +95,15 @@ Go to **Store Settings > Zano** to enable it and set your preferred confirmation
 
 ## Docker
 
-A Docker image with zanod and simplewallet is available:
+Connect BTCPay Server, the daemon and the wallet to the same user-defined Docker network so their container names resolve. Keep wallet RPC on that private network without publishing its port to the host. The plugin does not send wallet RPC authentication credentials, so restrict access to the BTCPay service and trusted operators.
 
-```bash
-docker pull pavelravaga/zano:2.2.0.455
-```
-
-Run the daemon:
-```bash
-docker run -d --name zanod \
-  -p 11211:11211 \
-  -v zano_data:/data \
-  pavelravaga/zano:2.2.0.455
-```
-
-Run the wallet:
-```bash
-docker run -d --name zano_wallet \
-  -p 11212:11212 \
-  -v zano_wallet:/wallet \
-  --entrypoint simplewallet \
-  pavelravaga/zano:2.2.0.455 \
-  --rpc-bind-ip=0.0.0.0 --rpc-bind-port=11212 \
-  --daemon-address=zanod:11211 \
-  --wallet-file=/wallet/wallet --password=""
-```
+The integration test Compose file provides a disposable **testnet-only** example with a pinned testnet wallet image. It is not a production deployment template. For mainnet, use binaries or an image built for mainnet and a dedicated receiving wallet. When running the services directly on one host, use the loopback bindings shown above.
 
 ## Development
 
 ### Requirements
 
-- .NET SDK 10.0.402 or later (BTCPay Server 2.4.5 or later)
+- .NET SDK 10.0.400 or later (BTCPay Server 2.4.5 or later)
 - Git
 - Docker and Docker Compose
 
@@ -159,6 +137,7 @@ Dependency submission is optional. Enable the repository's dependency graph, the
 
 - **Address generation**: Integrated addresses with random 8-byte payment IDs (unique per invoice)
 - **Payment detection**: Polls `get_recent_txs_and_info2` every 15 seconds; targeted RPC lookups support reconciliation
+- **History window**: Each poll reads up to 2,000 recent wallet transactions. Recorded payments also receive targeted confirmation checks. After long downtime or heavy wallet activity, older payments that were never detected require manual review. Invoices already marked Invalid are not automatically recovered. Use a dedicated receiving wallet.
 - **Fee**: The sender wallet pays the network fee separately; the plugin adds no payment-method fee
 - **Divisibility**: 12 decimal places
 - **Rate source**: CoinPaprika (`ZANO_USD`). The plugin registers the provider, so USD-priced ZANO invoices work without a separate rate plugin or API key. Other fiat currencies use BTCPay's configured USD conversion rules. Stores with custom CoinGecko scripts must replace their old ZANO rules with `ZANO_USD = zanocoinpaprika(ZANO_USD)` and `ZANO_X = ZANO_USD * USD_X`.
